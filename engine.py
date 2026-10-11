@@ -40,6 +40,7 @@ class Engine:
         self.trigger = asyncio.Event()
         self.tasks = []
         self.busy, self.next_check = False, None
+        self.scan_revision = None
         self.stopping = False
         # A process restart cannot restore the live page or its temporary access.
         with store.transaction():
@@ -158,7 +159,10 @@ class Engine:
     def full_results(self):
         rt = self.runtime()
         if not rt['last']:
-            return ['当前条件尚未完成查询，请稍后发送 /results。']
+            if rt['error']:
+                return ['当前条件尚无成功查询结果。\n最近一次失败：' + rt['error'] +
+                        '\n发送 /diagnose 查看本轮失败证据，/browser 或 /check 重试。']
+            return ['当前条件尚未完成查询。' + ('正在查询，请等待本轮完成。' if self.busy else '发送 /check 开始查询。')]
         last = rt['last']
         messages = summaries(last['matches']) or ['最近一轮未发现符合条件的可选时段。']
         messages[0] = '查询时间：' + last['checked_at'][:19].replace('T', ' ') + '（新加坡时间）\n' + messages[0]
@@ -183,6 +187,7 @@ class Engine:
                   error_notified=False, completed=False, last_notification=None)
         if previous is None:
             rt['enabled'] = True
+        self.store.set('manual_query', None)
         self.store.set('config', candidate.dict())
         self.store.set('runtime', rt)
         self.trigger.set()
@@ -248,6 +253,7 @@ class Engine:
                     raise ValueError('请先用 /set 或 /dates 设置未来的条件。')
                 if enabled != rt['enabled']:
                     rt.update(enabled=enabled, revision=rt['revision'] + 1, completed=False)
+                    self.store.set('manual_query', None)
                     self.store.set('runtime', rt)
                 self.trigger.set()
                 reply = '监控已恢复。' if enabled else '监控已暂停，仍可修改条件。'
@@ -263,13 +269,19 @@ class Engine:
                         raise ValueError('人工入口需要 Render 中的 BROWSERLESS_TOKEN，并使用 BROWSER_PROVIDER=browserless。')
                 handoff = getattr(self.scanner, 'handoff', None)
                 if command == '/browser' and handoff and self.scanner.valid_handoff(handoff['id']):
+                    self.store.set('manual_query', {'revision': rt['revision'], 'command': command})
                     self.store.queue([self.scanner.human_message()], rt['revision'], 'human:' + handoff['id'])
                     reply = '已安排重新发送当前人工操作入口；请尽快打开，入口不会延长。'
-                elif self.busy:
-                    reply = '正在查询；若需人工处理，会通过 Telegram 发送入口。完成后可用 /results 查看结果。'
                 else:
-                    self.trigger.set()
-                    reply = '已安排一次查询；新增时段会自动提醒，完整结果可用 /results 查看。'
+                    # Manual requests get their own outcome. Automatic fault
+                    # suppression must not make an explicit retry look ignored.
+                    self.store.set('manual_query', {'revision': rt['revision'], 'command': command})
+                    if self.busy and self.scan_revision == rt['revision']:
+                        reply = '正在查询；已记录你的手动请求，本轮会回复成功或失败。需要人工处理时会另发操作入口。'
+                    else:
+                        self.trigger.set()
+                        reply = ('已安排人工入口查询；需要验证时会发送入口，未生成入口也会回复本轮原因。'
+                                 if command == '/browser' else '已安排一次查询；本轮会回复成功或失败，新增时段会自动提醒。')
             elif '/' in text and not text.startswith('/'):
                 reply = self.change_config(parse_set(text))
             else:
@@ -340,18 +352,26 @@ class Engine:
         rt = self.runtime()
         return rt['enabled'] and rt['revision'] == revision
 
+    def manual_request(self, revision):
+        request = self.store.get('manual_query')
+        return request if request and request.get('revision') == revision else None
+
     async def run_scan(self):
         config, rt = self.config(), self.runtime()
         if not config or not rt['enabled'] or not self.store.get('owner') or not self.ready:
             return
         revision = rt['revision']
         self.busy = True
+        self.scan_revision = revision
+        self.next_check = None
         try:
             if config.expired():
                 with self.store.transaction():
                     rt.update(enabled=False, completed=True)
                     self.store.set('runtime', rt)
                     self.store.queue(['监控已结束：指定日期和时间已过期。'], revision, 'status')
+                    if self.manual_request(revision):
+                        self.store.set('manual_query', None)
                 return
             async def notify_human(handoff):
                 if self.current(revision) and self.scanner.valid_handoff(handoff['id']):
@@ -364,10 +384,15 @@ class Engine:
                 return
             latest = self.runtime()
             new = [s for s in result['matches'] if s['key'] not in latest['seen']]
+            manual = self.manual_request(revision)
             with self.store.transaction():
                 if new:
                     self.store.queue(summaries(new), revision)
-                if latest['error_notified']:
+                if manual:
+                    self.store.queue([f"本次 {manual['command']} 查询已完成；符合条件 {len(result['matches'])} 个时段，"
+                                      f"新增或重新出现 {len(new)} 个。完整结果发送 /results 查看。"], revision, 'manual')
+                    self.store.set('manual_query', None)
+                elif latest['error_notified']:
                     self.store.queue(['ActiveSG 查询已恢复。'], revision, 'status')
                 latest.update(last=result, seen=[s['key'] for s in result['matches']], error=None, error_notified=False)
                 self.store.set('runtime', latest)
@@ -378,7 +403,13 @@ class Engine:
                 latest = self.runtime()
                 with self.store.transaction():
                     latest['error'] = text
-                    if not latest['error_notified']:
+                    manual = self.manual_request(revision)
+                    if manual:
+                        self.store.queue([f"本次 {manual['command']} 未完成查询：" + text +
+                                          '\n发送 /diagnose 查看本轮失败证据。'], revision, 'manual')
+                        self.store.set('manual_query', None)
+                        latest['error_notified'] = True
+                    elif not latest['error_notified']:
                         self.store.queue(['ActiveSG 监控需要处理：' + text + '\n修复后将自动重试。'], revision, 'status')
                         latest['error_notified'] = True
                     self.store.set('runtime', latest)
@@ -386,6 +417,7 @@ class Engine:
             self.scanner.on_human = None
             self.scanner.is_current = lambda: True
             self.busy = False
+            self.scan_revision = None
 
     async def monitor_loop(self):
         self.trigger.set()

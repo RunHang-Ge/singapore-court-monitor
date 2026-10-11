@@ -86,6 +86,13 @@ def format_failure(value, include_url=False):
     lines.extend('证据：' + item for item in value.get('evidence', []))
     if value.get('headers', {}).get('cf-ray'):
         lines.append('Cloudflare 请求编号：' + value['headers']['cf-ray'])
+    lookup = value.get('lookup')
+    if isinstance(lookup, dict):
+        label = '场馆' if lookup.get('kind') == 'venue' else '运动项目'
+        lines.append('查找阶段：' + label + '选择')
+        lines.append('目标名称：' + str(lookup.get('requested', ''))[:200])
+        candidates = lookup.get('candidate_names', [])
+        lines.append('页面读取到的名称：' + ('、'.join(str(n)[:100] for n in candidates[:8]) if candidates else '没有读取到活动或场馆链接，可能仍未加载或官网结构改变'))
     if include_url:
         lines.append('页面来源：' + value.get('url', '未取得'))
     lines.append('说明：' + value.get('error', ''))

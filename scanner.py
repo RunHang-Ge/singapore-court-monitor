@@ -8,6 +8,7 @@ import math
 import time
 from pathlib import Path
 import re
+import unicodedata
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 from query_diagnostics import classify, safe_url, load_failure
@@ -389,15 +390,63 @@ class Scanner:
             pass
         return await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
 
-    async def find_link(self, page, name):
-        # Links inside an unexpanded activity accordion can be hidden.
-        links = await page.locator('a[href]').evaluate_all('''nodes => nodes.map(n => ({
-          text: (n.textContent || '').replace(/\\s+/g, ' ').trim(), href: n.href
-        }))''')
-        hits = {official_url(item['href']) for item in links if item['text'].casefold() == name.strip().casefold()}
-        if len(hits) != 1:
-            raise ScanError(f'无法唯一找到「{name}」，请核对官网英文全名，或检查页面是否需要验证。')
-        return hits.pop()
+    async def find_link(self, page, name, kind='activity', timeout=12, poll_interval=0.5):
+        # Framework navigation can leave a document with headings but no cards
+        # yet. Match exact names in card headings/accessible labels, not arbitrary
+        # substrings of a card that may also contain prices and court counts.
+        def normalize(text):
+            return re.sub(r'\s+', ' ', unicodedata.normalize('NFKC', text)).strip().casefold()
+        target = normalize(name)
+        deadline = time.monotonic() + timeout
+        if self.remote_deadline:
+            deadline = min(deadline, self.remote_deadline - 15)
+        names, hits = [], set()
+        while True:
+            if not self.is_current():
+                raise ScanError('本轮查询已取消。')
+            await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
+            links = await page.locator('a[href]').evaluate_all("""nodes => nodes.map(n => ({
+              href: n.href,
+              labels: [n.querySelector('h1,h2,h3,h4,[role="heading"]')?.textContent || '',
+                       n.getAttribute('aria-label') || '', n.textContent || '']
+                .map(s => s.replace(/\\s+/g, ' ').trim()).filter(Boolean)
+            }))""")
+            names, hits = [], set()
+            for item in links:
+                try:
+                    destination = official_url(item['href'])
+                except ScanError:
+                    continue
+                labels = item['labels']
+                if any(normalize(label) == target for label in labels):
+                    hits.add(destination)
+                if labels:
+                    label = labels[0][:100]
+                    if label not in names:
+                        names.append(label)
+            if len(hits) == 1:
+                return hits.pop()
+            if len(hits) > 1 or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(poll_interval)
+        words = set(target.split())
+        names.sort(key=lambda text: (-len(words.intersection(normalize(text).split())), text.casefold()))
+        names = names[:8]
+        label = '场馆' if kind == 'venue' else '运动项目'
+        text = (f'官网出现多个名为「{name}」的{label}链接，无法唯一选择。' if len(hits) > 1
+                else f'未能找到「{name}」的{label}链接；已等待列表加载。')
+        if names and not hits:
+            text += ' 页面可见名称：' + '、'.join(names[:3]) + '。'
+        text += ' 发送 /diagnose 查看本轮页面证据。'
+        try:
+            diagnostic, _ = await asyncio.wait_for(self.inspect_page(page), timeout=3)
+        except Exception:
+            diagnostic = {'category': 'unavailable', 'label': '未取得页面证据', 'evidence': []}
+        diagnostic['lookup'] = {'kind': kind, 'requested': name[:200], 'candidate_names': names,
+                                'exact_destinations': len(hits)}
+        failure = ScanError(text)
+        failure.diagnostic = diagnostic
+        raise failure
 
     async def scan(self, config):
         if self.lock.locked():
@@ -430,7 +479,7 @@ class Scanner:
         await self.goto(page, ACTIVITIES)
         activity_link = await self.find_link(page, config.activity)
         await self.goto(page, activity_link)
-        venue_link = await self.find_link(page, config.venue)
+        venue_link = await self.find_link(page, config.venue, kind='venue')
         results, found = [], {}
         for day in config.days():
             if not self.is_current():

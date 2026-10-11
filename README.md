@@ -93,7 +93,7 @@ Hobby 是工作区套餐，Build Pipeline Starter 是构建配置。运行实例
 
 也可直接发送 `Tennis / Kallang Tennis Centre / 日期范围 / 时间范围`。
 最多 31 天、同一天内至少一小时；所有时间按新加坡解释。不可选日期会标记为未确认，不会使用官网跳转到其他日期的数据。
-`/check` 立即安排查询，但遵循去重规则；需要完整结果时使用 `/results`。
+`/check` 与 `/browser` 的每次手动请求会回复本轮成功或失败；这类回复不受自动故障去重影响。成功时报告时段总数和新增数，完整列表使用 `/results`。定时扫描仍只播报新增或重新出现的时段，重复故障只提示一次。
 如果汇总超出 Telegram 单条消息长度限制，会按整天分成少量连续消息，不截断或丢弃时段。
 
 ## 人工处理验证：Telegram 远程操作入口
@@ -119,7 +119,7 @@ Hobby 是工作区套餐，Build Pipeline Starter 是构建配置。运行实例
 2. 网站检查等待约五秒仍未完成时，机器人发送临时远程操作入口和准确到期时间。打开入口即可操作同一个云端浏览器；iPhone 可通过 Safari 打开。入口通常不足 90 秒，收到后立即打开。
 3. 在远程画面中手动完成检查。程序会检查页面实际状态，只有恢复官网场地页面后才继续提取数据；点击 Done 不代表验证已通过。不自动登录、预约、付款或调用验证码自动代答。
 4. 处理期间不要 `/pause`；暂停或修改条件会取消旧入口。处理失败/入口过期后发送 `/browser` 重试；还在有效期内时 `/browser` 会重新发送同一入口，不延长时间。
-5. 发送 `/status` 看查询是否成功；`/results` 查看整轮结果。出现验证入口不表示已取得场地数据。
+5. 发送 `/status` 看查询是否成功；`/results` 查看整轮结果。出现验证入口不表示已取得场地数据。如果未生成入口或后续读取失败，会回复本轮原因。
 
 入口发给已绑定的私聊账号，不含服务 API Token，但持有入口的人可操作该页面，不要转发。程序不记录直播或额外保存登录画面；生成失败、过期或重启后的入口不会从通知队列重新发出。浏览器会话断开后远程 Cookie/缓存尽量保留在同一档案，下次查询复用；网站也可能因验证到期或连接条件变化再次要求检查。
 
@@ -133,7 +133,7 @@ Browserless 免费方案的单次浏览器连接最长两分钟；入口不能�
 
 ## 确认安全检查的来源
 
-发送 /diagnose 获取最近一次失败时保存的证据。服务首页「上次查询失败时的证据」可显示页面标题、来源网址（已去除查询参数）、主页面 HTTP 状态、Cloudflare 标记和失败截图；读取证据不会启动浏览器。查询失败后才会保存，因此上线这个版本后需要再查询一次。
+发送 /diagnose 获取最近一次失败时保存的证据。活动或场馆匹配失败时，还会显示查找阶段、目标名称与页面读取到的候选名称；仅记录官网 facility-bookings 链接中的名称，不保存完整正文、登录字段或带参数的地址。服务首页「上次查询失败时的证据」可显示页面标题、来源网址（已去除查询参数）、主页面 HTTP 状态、Cloudflare 标记和失败截图；读取证据不会启动浏览器。查询失败后才会保存，因此上线这个版本后需要再查询一次。
 
 - cf-mitigated: challenge 明确证明收到 Cloudflare 整页检查；检查页中的 _cf_chl_opt 也是其明确标记。
 - CF-Ray 或 Server: cloudflare 单独出现只能说明经过 Cloudflare，不能证明拦截。Cloudflare 脚本或品牌文字与检查文字同时出现时仍标为「疑似」。
@@ -163,7 +163,7 @@ cd F:\Github\singapore-court-monitor
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
-.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser
+.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser test_query_feedback
 .\.venv\Scripts\python.exe browser_diagnostic.py --check
 ```
 
@@ -184,7 +184,7 @@ py -3.13 -m venv .venv
 
 - `main.py`：网页服务、管理页权限、Telegram webhook。
 - `engine.py`：指令、定时查询、结果比较和通知队列。
-- `scanner.py`：官网导航、日期核验、时段读取、人工接管和浏览器操作。
+- `scanner.py`：官网导航、活动与场馆卡片加载等待、名称唯一核验、日期核验、时段读取、人工接管和浏览器操作。
 - `remote_browser.py`：Browserless 档案创建与复用、临时入口校验和关闭。
 - `models.py`：参数解析、新加坡时间、一小时筛选、通知格式。
 - `storage.py`：SQLite 持久化。
