@@ -3,7 +3,7 @@
 <style>body{font:16px/1.6 system-ui;background:#f4f6f8;color:#182938;max-width:1000px;margin:30px auto;padding:0 20px}section{background:white;border:1px solid #dee5ed;border-radius:14px;padding:24px;margin:20px 0}h1{font-size:26px}h2{font-size:20px}button,input{font:inherit;padding:9px 14px;border-radius:8px;border:1px solid #bac7d5}button{cursor:pointer;background:#eff5ff}pre{white-space:pre-wrap;font:inherit}#screen{width:100%;height:auto;border:1px solid #dee5ed;cursor:crosshair}#message{color:#8a3d14}details p{color:#536778}.actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}input{max-width:65%}</style></head>
 <body><h1>ActiveSG 空场提醒</h1><p>在 Telegram 私聊中修改条件、查看结果和暂停监控。</p>
 <section><h2>运行状态</h2><pre id="status">正在读取…</pre><p id="connection"></p><p id="memory"></p><pre id="binding"></pre></section>
-<section><h2>网站验证与浏览器</h2><p>出现验证时，先在 Telegram 发送 /pause。点击刷新画面，直接点击画面中的按钮；处理完成后发送 /resume。</p><p>此入口可查看并操作服务浏览器；网站仍可能拒绝云端访问。查询结束后会释放浏览器；手动操作闲置两分钟后也会关闭，Cookie 保留在磁盘。</p>
+<section><h2>网站验证与浏览器</h2><p>启用 Browserless 后，出现验证时会通过 Telegram 发送临时远程操作入口。也可发送 /browser 立即查询；如果监控已暂停，请先 /resume。处理远程入口期间不要 /pause，它会取消入口。下方截图操作仅为备用调试入口，操作前需暂停并等待查询结束。</p><p>此入口可查看并操作服务浏览器；网站仍可能拒绝云端访问。查询结束后会释放浏览器；手动操作闲置两分钟后也会关闭，Cookie 保留在磁盘。</p>
 <div class="actions"><button id="refresh">刷新画面</button><button id="open">打开 ActiveSG 活动页</button><button id="up">向上滚动</button><button id="down">向下滚动</button><button id="close">关闭浏览器释放内存</button></div>
 <p id="message" role="status"></p><img id="screen" alt="服务浏览器画面" hidden>
 <div class="actions"><input id="text" type="password" placeholder="输入到浏览器当前选中的输入框" autocomplete="off"><button id="type">输入文字</button><button id="enter">Enter</button><button id="tab">Tab</button><button id="back">退格</button></div>

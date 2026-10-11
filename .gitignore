@@ -11,3 +11,7 @@ state/
 *.sqlite3*
 *.log
 .playwright-browsers/
+
+# Persisted remote profile endpoints contain server credentials.
+browserless-profile.json
+browserless-profile.tmp

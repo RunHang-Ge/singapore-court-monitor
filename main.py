@@ -70,7 +70,8 @@ def admin(request: Request, credentials: HTTPBasicCredentials | None = Depends(s
 @app.get('/healthz')
 async def health(request: Request):
     engine = request.app.state.engine
-    return {'status': 'ok', 'telegram_connected': engine.ready, 'monitor_configured': engine.config() is not None}
+    return {'status': 'ok', 'telegram_connected': engine.ready, 'monitor_configured': engine.config() is not None,
+            'revision': os.getenv('RENDER_GIT_COMMIT'), 'features': ['telegram_human_browser']}
 
 
 @app.post('/telegram/webhook')
@@ -114,7 +115,7 @@ async def status(request: Request):
     return {'text': engine.status(), 'telegram_connected': engine.ready,
             'connection_error': engine.connection_error, 'bound': bool(engine.store.get('owner')),
             'browser_busy': engine.scanner.busy,
-            'browser_active': engine.scanner.browser_active, 'memory': snapshot(),
+            'browser_active': engine.scanner.browser_active, 'human_waiting': bool(engine.scanner.handoff), 'memory': snapshot(),
             'binding_command': '/start ' + engine.binding_code if not engine.store.get('owner') else None,
             'persistent_disk_configured': os.getenv('DATA_DIR', '').startswith('/var/data')}
 

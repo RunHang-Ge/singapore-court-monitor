@@ -84,6 +84,7 @@ Hobby 是工作区套餐，Build Pipeline Starter 是构建配置。运行实例
 /time 7pm-10pm
 /status
 /results
+/browser
 /check
 /pause
 /resume
@@ -95,16 +96,40 @@ Hobby 是工作区套餐，Build Pipeline Starter 是构建配置。运行实例
 `/check` 立即安排查询，但遵循去重规则；需要完整结果时使用 `/results`。
 如果汇总超出 Telegram 单条消息长度限制，会按整天分成少量连续消息，不截断或丢弃时段。
 
-## 浏览器验证和原生环境限制
+## 人工处理验证：Telegram 远程操作入口
 
-`build.sh` 安装 Playwright 的 Chromium 并运行启动诊断。原生 Python 环境是否具备 Chromium 需要的系统库，必须在实际 Render 构建中验证。仅安装 Python 包不能保证浏览器可运行。
+此路线保持 Render 的 Python 3 Web Service，Chrome 在 Browserless 中运行。设置好变量后构建会跳过 Render 本机 Chromium 的安装和启动；Render 无需启动桌面窗口。主服务仍需保持单实例、一个 worker。
 
-- 构建显示浏览器启动失败：将日志中缺少的系统库名称提供给维护者；如果原生环境无法提供这些库，需要配置远程浏览器，或者重新讨论部署方式。不要反复增加 pip 包来代替系统库。
-- 程序会先等待网站自动完成安全检查，最多 45 秒；不会因短暂显示检查页而立即报告失败。仍未完成时才提示查询受阻。
-- ActiveSG 显示 Cloudflare 验证：在机器人发 `/pause`，等正在进行的查询结束。登录服务首页，刷新浏览器画面，手动点击页面按钮，必要时向下滚动。处理后发 `/resume`。
-- 管理画面使用云端 Chromium 的截图和输入操作，不会绕过网站验证。部分验证在无头浏览器或云端 IP 上始终无法通过，这种情况下查询仍然不可用。
-- 官网要求 Singpass 或跳到外部页面时不会自动登录。服务也不保存 Singpass 密码。
-- 不能仅凭“部署成功”或健康检查成功认定读取到了预约数据。
+在 Render → Environment 设置：
+
+| 名称 | 值 |
+|---|---|
+| BROWSERLESS_TOKEN | 在 Browserless 账号中取得，只填 Render，不发送到聊天或 GitHub |
+| BROWSER_PROVIDER | browserless（缺少 Token 时直接报告配置问题，避免意外启动本机 Chrome） |
+| BROWSERLESS_REGION | sfo（可省略；也可选 lon、ams，切换区域会创建新档案） |
+| BROWSERLESS_TIMEOUT_SECONDS | 120（免费账号保持默认；增大需要对应账号支持） |
+
+`BROWSER_PROVIDER` 未设置时默认 auto：有 BROWSERLESS_TOKEN 自动使用 Browserless，否则使用原有本机模式。已设置的 BROWSER_CDP_URL 在 Browserless 模式下不使用。不要将 BROWSER_HEADLESS 改成 false，远程模式自身使用有界面的 Chrome。
+
+部署流程：GitHub Desktop → Commit（若代码已提交则跳过）→ Push origin；Render 自动部署或 Manual Deploy → Deploy latest commit，等待 Live。
+
+在 @activeSG_monitor_bot 私聊中：
+
+1. 如果已暂停，发送 `/resume`；发送 `/browser` 立即安排查询。
+2. 网站检查等待约五秒仍未完成时，机器人发送临时远程操作入口和准确到期时间。打开入口即可操作同一个云端浏览器；iPhone 可通过 Safari 打开。入口通常不足 90 秒，收到后立即打开。
+3. 在远程画面中手动完成检查。程序会检查页面实际状态，只有恢复官网场地页面后才继续提取数据；点击 Done 不代表验证已通过。不自动登录、预约、付款或调用验证码自动代答。
+4. 处理期间不要 `/pause`；暂停或修改条件会取消旧入口。处理失败/入口过期后发送 `/browser` 重试；还在有效期内时 `/browser` 会重新发送同一入口，不延长时间。
+5. 发送 `/status` 看查询是否成功；`/results` 查看整轮结果。出现验证入口不表示已取得场地数据。
+
+入口发给已绑定的私聊账号，不含服务 API Token，但持有入口的人可操作该页面，不要转发。程序不记录直播或额外保存登录画面；生成失败、过期或重启后的入口不会从通知队列重新发出。浏览器会话断开后远程 Cookie/缓存尽量保留在同一档案，下次查询复用；网站也可能因验证到期或连接条件变化再次要求检查。
+
+Browserless 免费方案的单次浏览器连接最长两分钟；入口不能延长该连接。代码为人工处理和后续查询预留时间，但日期较多或响应缓慢时仍可能超时，整轮未完成不会通知部分场地结果。免费方案每月 1000 units，每次新连接至少消耗 1 unit；每 10 分钟持续运行 30 天有 4320 轮，免费额度无法覆盖全天整月监控。此版本先用免费额度验证人工处理是否有效，不自动购买套餐或付费代理。
+
+远程档案最长保留一天，并在 /var/data/browserless-profile.json 保存可复用连接（含凭据，文件权限 0600，Git 已忽略）。该文件不通过管理接口公开；部署重启保留档案，过期/Token 变化后创建新档案。不要分享该文件。Browserless 清理远程档案不等于 ActiveSG 验证有效期。
+
+**待实际验证的限制**：ActiveSG 仍可能拒绝 Browserless 的云端来源，Cloudflare 检查也不一定提供可以手动点击的选项。只有从真实官网成功完成整轮查询、且下轮能复用状态后，才能确认路线有效；单纯健康检查和本地测试通过不能确认。
+
+原有本机截图页面保留为调试备用：先暂停并等待查询结束，再刷新截图操作。它与 Telegram 的临时直播入口不是同一人工流程。若没有 Browserless，本机模式仍使用原有 45 秒自动等待和每轮关闭浏览器的策略，复杂页面加载峰值可能超过 512 MB。
 
 ## 确认安全检查的来源
 
@@ -138,7 +163,7 @@ cd F:\Github\singapore-court-monitor
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
-.\.venv\Scripts\python.exe -m unittest -v test_monitor
+.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser
 .\.venv\Scripts\python.exe browser_diagnostic.py --check
 ```
 
@@ -159,7 +184,8 @@ py -3.13 -m venv .venv
 
 - `main.py`：网页服务、管理页权限、Telegram webhook。
 - `engine.py`：指令、定时查询、结果比较和通知队列。
-- `scanner.py`：官网导航、日期核验、时段读取及浏览器操作。
+- `scanner.py`：官网导航、日期核验、时段读取、人工接管和浏览器操作。
+- `remote_browser.py`：Browserless 档案创建与复用、临时入口校验和关闭。
 - `models.py`：参数解析、新加坡时间、一小时筛选、通知格式。
 - `storage.py`：SQLite 持久化。
 - `telegram_api.py`：Telegram API，错误中不泄露 Token。
@@ -173,3 +199,6 @@ py -3.13 -m venv .venv
 - Render 免费实例限制：https://render.com/docs/free
 - Playwright 浏览器依赖：https://playwright.dev/python/docs/browsers
 - Telegram webhook：https://core.telegram.org/bots/api#setwebhook
+- Browserless 临时入口：https://docs.browserless.io/api-reference/cdp-extensions
+- Browserless 档案保留：https://docs.browserless.io/baas/session-management/persisting-state
+- Browserless 免费额度和连接时限：https://www.browserless.io/pricing

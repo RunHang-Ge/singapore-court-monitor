@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 
+from remote_browser import RemoteBrowserError
 from query_diagnostics import format_failure
 from models import Config, now_sg, parse_dates, parse_set, parse_window, summaries
 from telegram_api import TelegramError
@@ -20,6 +21,7 @@ HELP = '''可用指令：
 /status 查看条件与最近查询
 /results 返回最近一轮完整结果
 /diagnose 查看失败时保存的页面证据
+/browser 获取人工验证入口（通过 Telegram 发送）
 /check 立即查询一次
 /pause 暂停；/resume 恢复
 
@@ -39,6 +41,9 @@ class Engine:
         self.tasks = []
         self.busy, self.next_check = False, None
         self.stopping = False
+        # A process restart cannot restore the live page or its temporary access.
+        with store.transaction():
+            store.db.execute("DELETE FROM outbox WHERE kind LIKE 'human:%'")
         owner = os.getenv('TELEGRAM_USER_ID', '').strip()
         chat = os.getenv('TELEGRAM_CHAT_ID', '').strip() or owner
         if owner:
@@ -127,7 +132,14 @@ class Engine:
         config, rt = self.config(), self.runtime()
         owner = self.store.get('owner')
         state = '尚未设置条件' if config is None else '已到期' if rt['completed'] else '正在查询' if self.busy else '监控运行中' if rt['enabled'] else '已暂停'
+        handoff = getattr(self.scanner, 'handoff', None)
+        if handoff and self.scanner.valid_handoff(handoff['id']):
+            state = '等待人工处理网站验证（入口已安排发送到 Telegram）'
+        elif rt['enabled'] and rt['error'] and not self.busy:
+            state = '查询受阻，等待重试'
         lines = [config.text() if config else '尚未设置监控条件，请发送 /set。', '状态：' + state]
+        if handoff and self.scanner.valid_handoff(handoff['id']):
+            lines.append('人工入口到期：' + handoff['expires_at'])
         if not owner:
             lines.append('尚未绑定接收账号。')
         if self.next_check and rt['enabled']:
@@ -239,14 +251,22 @@ class Engine:
                     self.store.set('runtime', rt)
                 self.trigger.set()
                 reply = '监控已恢复。' if enabled else '监控已暂停，仍可修改条件。'
-            elif command == '/check':
+            elif command in ('/check', '/browser'):
                 config, rt = self.config(), self.runtime()
                 if not config or config.expired():
                     raise ValueError('请先设置未来的监控条件。')
                 if not rt['enabled']:
                     raise ValueError('监控已暂停，请先发送 /resume。')
-                if self.busy:
-                    reply = '正在查询，完成后可用 /results 查看结果。'
+                if command == '/browser':
+                    from remote_browser import provider
+                    if provider() != 'browserless':
+                        raise ValueError('人工入口需要 Render 中的 BROWSERLESS_TOKEN，并使用 BROWSER_PROVIDER=browserless。')
+                handoff = getattr(self.scanner, 'handoff', None)
+                if command == '/browser' and handoff and self.scanner.valid_handoff(handoff['id']):
+                    self.store.queue([self.scanner.human_message()], rt['revision'], 'human:' + handoff['id'])
+                    reply = '已安排重新发送当前人工操作入口；请尽快打开，入口不会延长。'
+                elif self.busy:
+                    reply = '正在查询；若需人工处理，会通过 Telegram 发送入口。完成后可用 /results 查看结果。'
                 else:
                     self.trigger.set()
                     reply = '已安排一次查询；新增时段会自动提醒，完整结果可用 /results 查看。'
@@ -255,7 +275,7 @@ class Engine:
             else:
                 reply = '无法识别这条指令。\n' + HELP
             return chat, [reply]
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, RemoteBrowserError) as error:
             return chat, [str(error)]
 
     async def update_loop(self):
@@ -297,6 +317,10 @@ class Engine:
                 await asyncio.sleep(0.5)
                 continue
             try:
+                if notice['kind'].startswith('human:') and not self.scanner.valid_handoff(notice['kind'][6:]):
+                    with self.store.transaction():
+                        self.store.sent_notice(notice['id'])
+                    continue
                 receipt = await self.telegram.send(owner['chat_id'], notice['text'])
                 with self.store.transaction():
                     self.store.sent_notice(notice['id'])
@@ -329,6 +353,12 @@ class Engine:
                     self.store.set('runtime', rt)
                     self.store.queue(['监控已结束：指定日期和时间已过期。'], revision, 'status')
                 return
+            async def notify_human(handoff):
+                if self.current(revision) and self.scanner.valid_handoff(handoff['id']):
+                    with self.store.transaction():
+                        self.store.queue([self.scanner.human_message()], revision, 'human:' + handoff['id'])
+            self.scanner.on_human = notify_human
+            self.scanner.is_current = lambda: self.current(revision) and not self.stopping
             result = await self.scanner.scan(config)
             if not self.current(revision):
                 return
@@ -353,6 +383,8 @@ class Engine:
                         latest['error_notified'] = True
                     self.store.set('runtime', latest)
         finally:
+            self.scanner.on_human = None
+            self.scanner.is_current = lambda: True
             self.busy = False
 
     async def monitor_loop(self):

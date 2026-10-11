@@ -4,12 +4,14 @@ import json
 from datetime import date, datetime
 import os
 import logging
+import math
 import time
 from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 from query_diagnostics import classify, safe_url, load_failure
+from remote_browser import RemoteProfile, RemoteBrowserError, provider, live_url, revoke
 from memory_usage import log_memory
 from models import now_sg, slot_from_control
 
@@ -70,6 +72,11 @@ class Scanner:
         self.last_manual_use = 0.0
         self.manual_idle_seconds = 120
         self.document_response = {}
+        self.remote_profile = RemoteProfile(directory)
+        self.remote_deadline = 0.0
+        self.handoff = None
+        self.on_human = None
+        self.is_current = lambda: True
 
     @property
     def browser_active(self):
@@ -131,9 +138,17 @@ class Scanner:
         log_memory('before_browser_start')
         try:
             self.playwright = await async_playwright().start()
-            endpoint = os.getenv('BROWSER_CDP_URL', '')
+            remote = provider() == 'browserless'
+            endpoint = await self.remote_profile.endpoint() if remote else os.getenv('BROWSER_CDP_URL', '')
+            self.remote_deadline = time.monotonic() + self.remote_profile.timeout_seconds - 3 if remote else 0.0
             if endpoint:
-                self.browser = await self.playwright.chromium.connect_over_cdp(endpoint, timeout=20000)
+                try:
+                    self.browser = await self.playwright.chromium.connect_over_cdp(endpoint, timeout=20000)
+                except Exception:
+                    if remote:
+                        self.remote_profile.forget()
+                        raise RemoteBrowserError('Browserless 连接失败；请查看账号额度、区域和会话限制。下轮会重新建立会话。') from None
+                    raise
                 if not self.browser.contexts:
                     raise ScanError('远程浏览器没有可用的会话。')
                 self.context = self.browser.contexts[0]
@@ -153,12 +168,16 @@ class Scanner:
                     if extra is not self.page:
                         await extra.close()
                 self.context.on('page', self.close_extra_page)
+            if remote:
+                await self.page.set_viewport_size({'width': 1280, 'height': 900})
             self.document_response = {}
             self.page.on('response', self.observe_response)
             self.page.set_default_timeout(15000)
             log_memory('after_browser_start', True)
         except BaseException as error:
             await self.release_browser()
+            if isinstance(error, RemoteBrowserError):
+                raise ScanError(str(error)) from None
             if isinstance(error, (ScanError, asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                 raise
             raise ScanError('云端浏览器启动失败，请检查 Chromium 安装、系统依赖和服务内存；详情见浏览器诊断。') from None
@@ -240,6 +259,105 @@ class Scanner:
     def last_failure(self):
         return load_failure(self.directory)
 
+    def valid_handoff(self, identifier):
+        item = self.handoff
+        return bool(item and item['id'] == identifier and item['deadline'] > time.monotonic()
+                    and self.is_current())
+
+    def human_message(self):
+        item = self.handoff
+        if not item or not self.valid_handoff(item['id']):
+            return None
+        return ('ActiveSG 需要你手动处理网站验证。\n'
+                '请立即打开以下远程浏览器入口（iPhone 可用 Safari 打开）：\n' + item['url'] +
+                '\n入口于 ' + item['expires_at'] + '（新加坡时间）失效。\n'
+                '在画面中完成验证，看到 ActiveSG 场地页面后等待自动查询。'
+                '本次请不要发送 /pause，它会取消入口。\n'
+                '入口失效后发送 /browser 重试。请勿转发该入口。')
+
+    async def human_intervention(self, page, error, poll_interval=1):
+        from playwright.async_api import Error as BrowserError
+        if not self.on_human or not self.is_current():
+            raise VerificationRequired('人工操作未开始或查询已取消。', error.diagnostic)
+        remaining = self.remote_deadline - time.monotonic() - 20
+        if remaining < 10:
+            raise VerificationRequired('本次远程会话剩余时间不足，请发送 /browser 重新查询。', error.diagnostic)
+        cdp = await self.context.new_cdp_session(page)
+        state = {'reason': None, 'id': None}
+        def completed(event):
+            if event.get('liveURLId') == state['id']:
+                state['reason'] = event.get('reason')
+        cdp.on('Browserless.liveComplete', completed)
+        identifier = None
+        try:
+            try:
+                response = await asyncio.wait_for(cdp.send('Browserless.liveURL', {
+                    'quality': 30, 'type': 'jpeg', 'interactable': True, 'resizable': False,
+                    'showBrowserInterface': False, 'timeout': int(min(90, remaining) * 1000),
+                    'instructions': '请在页面中手动完成网站验证。看到 ActiveSG 页面后等待程序继续查询。'
+                                    '如无法完成，可选择 Couldn’t finish。'}), timeout=8)
+                identifier = response.get('liveURLId')
+                if response.get('error') or not identifier:
+                    raise RemoteBrowserError('Browserless 无法生成操作入口，请检查账号的 LiveURL 支持和剩余会话时间。')
+                state['id'] = identifier
+                url = live_url(response['liveURL'], os.getenv('BROWSERLESS_TOKEN', '').strip())
+                applied = float(response['timeout']) / 1000
+                if not math.isfinite(applied) or applied <= 0:
+                    raise ValueError()
+                seconds = min(applied, remaining, 90)
+            except RemoteBrowserError as failure:
+                raise VerificationRequired(str(failure), error.diagnostic) from None
+            except Exception:
+                raise VerificationRequired('远程操作入口创建失败，请检查 Browserless 账号；未发送服务凭据。', error.diagnostic) from None
+            from datetime import timedelta
+            import secrets
+            self.handoff = {'id': secrets.token_hex(16), 'url': url,
+                            'deadline': time.monotonic() + seconds,
+                            'expires_at': (now_sg() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S')}
+            await self.on_human(self.handoff)
+            while time.monotonic() < self.handoff['deadline']:
+                if not self.is_current():
+                    raise VerificationRequired('查询条件已更改或监控已暂停，人工入口已取消。', error.diagnostic)
+                try:
+                    text = await self.guard(page)
+                    # Completion buttons are a viewer's report, not proof of clearance.
+                    # A blank page or redirect also cannot confirm successful validation.
+                    if (urlparse(page.url).hostname == 'activesg.gov.sg'
+                            and urlparse(page.url).path.startswith('/facility-bookings/')
+                            and len(text.strip()) >= 100):
+                        return text
+                except SecurityCheckPending:
+                    pass
+                except BrowserError as failure:
+                    if 'Execution context was destroyed' not in str(failure):
+                        raise VerificationRequired('远程浏览器会话已结束，尚未确认验证成功；请发送 /browser 重试。', error.diagnostic) from None
+                if state['reason'] in ('userFailed', 'closed', 'timeout'):
+                    raise VerificationRequired('人工处理未完成或入口已关闭，未读取本轮场地数据；请发送 /browser 重试。', error.diagnostic)
+                if state['reason'] == 'userDone':
+                    # The link has closed; allow automatic navigation to settle briefly.
+                    for _ in range(5):
+                        await asyncio.sleep(poll_interval)
+                        if not self.is_current():
+                            break
+                        try:
+                            text = await self.guard(page)
+                            if (urlparse(page.url).hostname == 'activesg.gov.sg'
+                                    and urlparse(page.url).path.startswith('/facility-bookings/') and len(text.strip()) >= 100):
+                                return text
+                        except SecurityCheckPending:
+                            pass
+                    raise VerificationRequired('点击完成后仍未确认进入场地页面，请发送 /browser 重试。', error.diagnostic)
+                await asyncio.sleep(poll_interval)
+            raise VerificationRequired('人工操作入口已过期，尚未确认验证成功。请发送 /browser 获取新入口。', error.diagnostic)
+        finally:
+            self.handoff = None
+            if identifier:
+                await revoke(cdp, identifier)
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+
     async def wait_until_ready(self, page, timeout=45, poll_interval=1):
         # A challenge page can finish its own checks and redirect automatically.
         # Waiting lets the site's scripts run; no checkbox or challenge is automated.
@@ -250,6 +368,8 @@ class Scanner:
                 return await self.guard(page)
             except SecurityCheckPending as error:
                 if asyncio.get_running_loop().time() >= deadline:
+                    if self.remote_deadline:
+                        return await self.human_intervention(page, error, poll_interval)
                     label = (error.diagnostic or {}).get('label', '来源未确认的安全检查')
                     raise VerificationRequired(
                         f'{label}等待 {timeout:g} 秒后仍未完成，未读取到场地数据。'
@@ -262,12 +382,12 @@ class Scanner:
 
     async def goto(self, page, url):
         await page.goto(official_url(url), wait_until='domcontentloaded', timeout=45000)
-        await self.wait_until_ready(page)
+        await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
         try:
-            await page.wait_for_load_state('networkidle', timeout=10000)
+            await page.wait_for_load_state('networkidle', timeout=2000 if self.remote_deadline else 10000)
         except Exception:
             pass
-        return await self.wait_until_ready(page)
+        return await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
 
     async def find_link(self, page, name):
         # Links inside an unexpanded activity accordion can be hidden.
@@ -302,6 +422,8 @@ class Scanner:
                     await self.release_browser()
                 finally:
                     self.busy = False
+                    self.remote_deadline = 0.0
+                    self.handoff = None
 
     async def _scan(self, config):
         page = await self.ensure_page()
@@ -311,6 +433,8 @@ class Scanner:
         venue_link = await self.find_link(page, config.venue)
         results, found = [], {}
         for day in config.days():
+            if not self.is_current():
+                raise ScanError('本轮查询已取消。')
             text = await self.goto(page, date_url(venue_link, day))
             for _ in range(8):
                 if 'Each slot is 1 hour long' in text:
