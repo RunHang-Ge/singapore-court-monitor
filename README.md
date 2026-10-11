@@ -184,7 +184,7 @@ py -3.13 -m venv .venv
 
 - `main.py`：网页服务、管理页权限、Telegram webhook。
 - `engine.py`：指令、定时查询、结果比较和通知队列。
-- `scanner.py`：官网导航、活动与场馆卡片加载等待、名称唯一核验、日期核验、时段读取、人工接管和浏览器操作。
+- `scanner.py`：官网导航、活动与场馆卡片加载等待、场馆名称与预览状态分离、名称唯一核验、日期核验、时段读取、人工接管和浏览器操作。
 - `remote_browser.py`：Browserless 档案创建与复用、临时入口校验和关闭。
 - `models.py`：参数解析、新加坡时间、一小时筛选、通知格式。
 - `storage.py`：SQLite 持久化。

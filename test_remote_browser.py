@@ -282,7 +282,7 @@ class HumanBrowserDOMTests(unittest.IsolatedAsyncioTestCase):
                     if path == '/facility-bookings/activities':
                         html = '<h1>ActiveSG Facility Bookings</h1><p>' + 'Select an activity and venue. ' * 8 + '</p><a href="/facility-bookings/activities/tennis">Tennis</a>'
                     elif path == '/facility-bookings/activities/tennis':
-                        html = '<a href="/facility-bookings/venues/kallang">Kallang Tennis Centre</a>'
+                        html = '<a href="/facility-bookings/venues/kallang"><div>Kallang Tennis Centre</div><div>Loading... ... ... ...</div></a>'
                     else:
                         html = f'''<h1>Kallang Tennis Centre</h1><p>Each slot is 1 hour long.</p>
                         <button aria-label="View timeslots for {label}" data-selected="true">date</button>

@@ -124,6 +124,75 @@ class QueryFeedbackTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VenueLoadingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_observed_card_text_status_is_not_part_of_venue_name(self):
+        from playwright.async_api import async_playwright
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        async with async_playwright() as driver:
+            browser = await driver.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                scanner = Scanner(directory)
+                scanner.page = page
+                for card in (
+                    '<div>Kallang Tennis Centre</div><div>Loading... ... ... ...</div>',
+                    'Kallang Tennis CentreLoading... ... ... ...',
+                    'Kallang Tennis CentreSlots availableMon, 12 Oct, 11:00 am',
+                ):
+                    async def fixture(route):
+                        await route.fulfill(content_type='text/html', body='<h1>Tennis</h1><a href="/facility-bookings/venues/kallang">' + card + '</a>')
+                    await page.route('https://activesg.gov.sg/**', fixture)
+                    await page.goto(ACTIVITIES)
+                    self.assertEqual(await scanner.find_link(page, 'Kallang Tennis Centre', kind='venue', timeout=0),
+                                     'https://activesg.gov.sg/facility-bookings/venues/kallang')
+                    await page.unroute('https://activesg.gov.sg/**', fixture)
+            finally:
+                await browser.close()
+
+    async def test_status_cleanup_does_not_select_similarly_named_venue(self):
+        from playwright.async_api import async_playwright
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        async with async_playwright() as driver:
+            browser = await driver.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.route('https://activesg.gov.sg/**', lambda route: route.fulfill(content_type='text/html', body='''
+                  <h1>Tennis</h1>
+                  <a href="/facility-bookings/venues/annex"><div>Kallang Tennis Centre Annex</div><div>Loading...</div></a>
+                  <a href="/facility-bookings/venues/other"><div>Other Tennis Centre</div><p>Nearby: <span>Kallang Tennis Centre</span></p></a>'''))
+                await page.goto(ACTIVITIES)
+                scanner = Scanner(directory)
+                scanner.page = page
+                with self.assertRaises(ScanError):
+                    await scanner.find_link(page, 'Kallang Tennis Centre', kind='venue', timeout=0)
+            finally:
+                await browser.close()
+
+    async def test_diagnostic_names_omit_loading_and_availability_footer(self):
+        from playwright.async_api import async_playwright
+        from query_diagnostics import format_failure
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        async with async_playwright() as driver:
+            browser = await driver.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.route('https://activesg.gov.sg/**', lambda route: route.fulfill(content_type='text/html', body='''
+                    <h1>Tennis</h1>
+                    <a href="/facility-bookings/venues/kallang">Kallang Tennis CentreLoading... ... ... ...</a>
+                    <a href="/facility-bookings/venues/burghley">Burghley Tennis CentreSlots availableMon, 12 Oct, 11:00 am</a>'''))
+                await page.goto(ACTIVITIES)
+                scanner = Scanner(directory)
+                scanner.page = page
+                with self.assertRaises(ScanError) as caught:
+                    await scanner.find_link(page, 'Missing Tennis Centre', kind='venue', timeout=0)
+                await scanner.save_failure(caught.exception)
+                diagnostic = scanner.last_failure()
+                self.assertEqual(set(diagnostic['lookup']['candidate_names']),
+                                 {'Kallang Tennis Centre', 'Burghley Tennis Centre'})
+                self.assertNotIn('Loading', format_failure(diagnostic))
+                self.assertNotIn('Slots available', format_failure(diagnostic))
+            finally:
+                await browser.close()
+
     async def test_delayed_card_heading_is_matched_without_fuzzy_selection(self):
         from playwright.async_api import async_playwright
         directory = self.enterContext(tempfile.TemporaryDirectory())

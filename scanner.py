@@ -396,6 +396,15 @@ class Scanner:
         # substrings of a card that may also contain prices and court counts.
         def normalize(text):
             return re.sub(r'\s+', ' ', unicodedata.normalize('NFKC', text)).strip().casefold()
+        def card_name(text):
+            text = re.sub(r'\s+', ' ', unicodedata.normalize('NFKC', text)).strip()
+            if kind == 'venue':
+                # Actual card text may concatenate its preview without whitespace:
+                # Kallang Tennis CentreLoading... / CentreSlots availableMon, ...
+                # Remove only known status markers; never accept a name prefix.
+                text = re.split(r'Loading\.{3}|Slots available(?=(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|[\s,:]|$))',
+                                text, maxsplit=1, flags=re.I)[0].strip()
+            return text
         target = normalize(name)
         deadline = time.monotonic() + timeout
         if self.remote_deadline:
@@ -405,19 +414,33 @@ class Scanner:
             if not self.is_current():
                 raise ScanError('本轮查询已取消。')
             await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
-            links = await page.locator('a[href]').evaluate_all("""nodes => nodes.map(n => ({
-              href: n.href,
-              labels: [n.querySelector('h1,h2,h3,h4,[role="heading"]')?.textContent || '',
-                       n.getAttribute('aria-label') || '', n.textContent || '']
-                .map(s => s.replace(/\\s+/g, ' ').trim()).filter(Boolean)
-            }))""")
+            links = await page.locator('a[href]').evaluate_all("""nodes => nodes.map(n => {
+              const walker = document.createTreeWalker(n, NodeFilter.SHOW_TEXT);
+              let first;
+              while ((first = walker.nextNode())) {
+                if (first.textContent.trim() && !first.parentElement.closest(
+                    'script,style,svg,[hidden],[aria-hidden="true"]')) break;
+              }
+              // Follow only the first content node's ancestors. Taking every
+              // descendant's text could mistake a nearby-venue note for a title.
+              const titles = first ? [first.textContent] : [];
+              let parent = first?.parentElement;
+              for (let i = 0; parent && parent !== n && i < 6; i++, parent = parent.parentElement) {
+                if (parent.textContent.length <= 1000) titles.push(parent.textContent);
+              }
+              return {href: n.href,
+                labels: [n.querySelector('h1,h2,h3,h4,[role="heading"]')?.textContent || '',
+                         n.getAttribute('aria-label') || '', ...titles, (n.textContent || '').slice(0, 1000)]
+                  .map(s => s.replace(/\\s+/g, ' ').trim()).filter(Boolean)};
+            })""")
             names, hits = [], set()
             for item in links:
                 try:
                     destination = official_url(item['href'])
                 except ScanError:
                     continue
-                labels = item['labels']
+                labels = [card_name(label) for label in item['labels']]
+                labels = [label for label in labels if label]
                 if any(normalize(label) == target for label in labels):
                     hits.add(destination)
                 if labels:
