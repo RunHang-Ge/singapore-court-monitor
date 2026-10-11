@@ -93,6 +93,21 @@ def format_failure(value, include_url=False):
         lines.append('目标名称：' + str(lookup.get('requested', ''))[:200])
         candidates = lookup.get('candidate_names', [])
         lines.append('页面读取到的名称：' + ('、'.join(str(n)[:100] for n in candidates[:8]) if candidates else '没有读取到活动或场馆链接，可能仍未加载或官网结构改变'))
+    slots = value.get('slots')
+    if isinstance(slots, dict):
+        lines.append('读取阶段：时段分组；日期：' + str(slots.get('date', '未知日期'))[:20])
+        labels = slots.get('labels', [])
+        headings = slots.get('headings', [])
+        lines.append('读到的分组文字：' + ('、'.join(str(n)[:80] for n in labels[:12]) if labels else '未识别到即时预约或抽签标题'))
+        lines.append('读到的页面标题文字：' + ('、'.join(str(n)[:80] for n in headings[:12]) if headings else '没有标题标签'))
+        lines.append('可见时段控件：' + str(slots.get('visible', 0)) +
+                     '；即时预约：' + str(slots.get('instant', 0)) +
+                     '；抽签：' + str(slots.get('ballot', 0)) +
+                     '；分组未确认：' + str(slots.get('unknown', 0)))
+        if slots.get('loading'):
+            lines.append('页面仍有可见的 Loading 提示')
+        if slots.get('stale_instant'):
+            lines.append('日期未一致或标识无法读取的即时预约控件：' + str(slots['stale_instant']))
     if include_url:
         lines.append('页面来源：' + value.get('url', '未取得'))
     lines.append('说明：' + value.get('error', ''))
