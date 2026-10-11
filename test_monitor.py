@@ -5,11 +5,11 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 from engine import Engine
 from models import Config, SG, now_sg, parse_set, slot_from_control, summaries
-from scanner import Scanner, ScanError, VerificationRequired, assert_date
+from scanner import Scanner, ScanError, SecurityCheckPending, VerificationRequired, assert_date
 from storage import Store
 from telegram_api import TelegramError
 
@@ -245,6 +245,27 @@ class WebTests(unittest.TestCase):
                 self.assertEqual(client.post('/telegram/webhook', headers=headers, json=update).status_code, 200)
                 self.assertEqual(client.post('/telegram/webhook', headers=headers, json=update).status_code, 200)
                 self.assertEqual(client.portal.call(lambda: app.state.engine.store.db.execute('SELECT COUNT(*) FROM updates').fetchone()[0]), 1)
+
+
+class ReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_automatic_security_check_can_finish(self):
+        scanner = Scanner('.')
+        scanner.guard = AsyncMock(side_effect=[SecurityCheckPending('checking'), 'available page'])
+        self.assertEqual(await scanner.wait_until_ready(object(), timeout=1, poll_interval=0.01), 'available page')
+
+    async def test_persistent_security_check_is_reported_after_wait(self):
+        scanner = Scanner('.')
+        scanner.guard = AsyncMock(side_effect=SecurityCheckPending('checking'))
+        with self.assertRaisesRegex(VerificationRequired, '仍未完成'):
+            await scanner.wait_until_ready(object(), timeout=0.03, poll_interval=0.01)
+        self.assertGreater(scanner.guard.await_count, 1)
+
+    async def test_real_login_requirement_is_not_retried_as_security_check(self):
+        scanner = Scanner('.')
+        scanner.guard = AsyncMock(side_effect=VerificationRequired('login required'))
+        with self.assertRaisesRegex(VerificationRequired, 'login required'):
+            await scanner.wait_until_ready(object(), timeout=1, poll_interval=0.01)
+        self.assertEqual(scanner.guard.await_count, 1)
 
 
 class BrowserFixtureTests(unittest.IsolatedAsyncioTestCase):

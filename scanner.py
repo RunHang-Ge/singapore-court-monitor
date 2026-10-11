@@ -19,6 +19,10 @@ class VerificationRequired(ScanError):
     pass
 
 
+class SecurityCheckPending(VerificationRequired):
+    pass
+
+
 def official_url(value, origin=BASE):
     url = urljoin(origin, value)
     parsed = urlparse(url)
@@ -91,19 +95,38 @@ class Scanner:
         title = await page.title()
         text = (await page.locator('body').inner_text())[:20000]
         if re.search(r'just a moment|performing security verification|verify (?:you are|that you)|enable javascript and cookies|checking your browser', title + '\n' + text, re.I):
-            raise VerificationRequired('ActiveSG 出现网站验证，尚未读取预约数据。请打开服务的浏览器页面检查；验证持续失败时，监控无法查询。')
+            raise SecurityCheckPending('ActiveSG 的网站安全检查尚未完成。')
         if re.search(r'singpass|/login|/sign-in', page.url, re.I):
             raise VerificationRequired('ActiveSG 要求登录，请在服务的浏览器页面检查。')
         return text
 
+    async def wait_until_ready(self, page, timeout=45, poll_interval=1):
+        # A challenge page can finish its own checks and redirect automatically.
+        # Waiting lets the site's scripts run; no checkbox or challenge is automated.
+        from playwright.async_api import Error as BrowserError
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            try:
+                return await self.guard(page)
+            except SecurityCheckPending:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise VerificationRequired(
+                        'ActiveSG 的网站安全检查等待 45 秒后仍未完成，自动查询未读取到场地数据。'
+                        '这不代表查询需要账号认证；可在服务的浏览器页面查看实际拦截页面。') from None
+            except BrowserError as error:
+                # Automatic navigation can replace the execution context mid-read.
+                if 'Execution context was destroyed' not in str(error) or asyncio.get_running_loop().time() >= deadline:
+                    raise
+            await asyncio.sleep(poll_interval)
+
     async def goto(self, page, url):
         await page.goto(official_url(url), wait_until='domcontentloaded', timeout=45000)
-        await self.guard(page)
+        await self.wait_until_ready(page)
         try:
             await page.wait_for_load_state('networkidle', timeout=10000)
         except Exception:
             pass
-        return await self.guard(page)
+        return await self.wait_until_ready(page)
 
     async def find_link(self, page, name):
         # Links inside an unexpanded activity accordion can be hidden.
