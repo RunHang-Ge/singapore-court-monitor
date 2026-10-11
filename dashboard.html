@@ -8,12 +8,17 @@
 <p id="message" role="status"></p><img id="screen" alt="服务浏览器画面" hidden>
 <div class="actions"><input id="text" type="password" placeholder="输入到浏览器当前选中的输入框" autocomplete="off"><button id="type">输入文字</button><button id="enter">Enter</button><button id="tab">Tab</button><button id="back">退格</button></div>
 <details><summary>首次绑定</summary><p>若尚未设置 Telegram 用户 ID，在机器人私聊发送 /start 后加上你在 Render 设置的 BINDING_CODE。完成绑定后发送 /help。</p></details>
-</section><script nonce="__CSRF__">
+</section>
+<section><h2>上次查询失败时的证据</h2><p>此处读取已保存的诊断，不会启动浏览器。时间对应上次失败，可能早于当前查询。</p><button id="diagnose">查看失败诊断</button><pre id="diagnostic"></pre><img id="failure-screen" alt="上次查询失败时的页面截图" hidden style="width:100%;height:auto"></section>
+<script nonce="__CSRF__">
+let failureImage;
 const csrf='__CSRF__';let currentImage;
 const $=id=>document.getElementById(id);
 async function state(){try{const r=await fetch('/status');if(!r.ok)throw Error('状态读取失败');const s=await r.json();$('status').textContent=s.text;const m=s.memory;$('memory').textContent=(m.container_mib===null?'当前环境无法读取容器内存。':'容器内存：'+m.container_mib+' MiB'+(m.limit_mib===null?'':' / '+m.limit_mib+' MiB'))+' 浏览器：'+(s.browser_active?'已打开':'已释放');$('connection').textContent=s.telegram_connected?'Telegram 已连接'+(s.bound?'，账号已绑定。':'，等待账号绑定。'):s.connection_error||'Telegram 正在连接…';$('binding').textContent=s.binding_command?'请在 @activeSG_monitor_bot 私聊中发送以下指令完成绑定：\n'+s.binding_command:'';if(!s.persistent_disk_configured)$('connection').textContent+=' 请确认已配置持久磁盘。';}catch(e){$('connection').textContent=e.message}}
 async function refresh(){try{$('message').textContent='正在读取画面…';const r=await fetch('/browser/screenshot');if(!r.ok){const e=await r.json();throw Error(e.detail)}const blob=await r.blob();if(currentImage)URL.revokeObjectURL(currentImage);currentImage=URL.createObjectURL(blob);$('screen').src=currentImage;$('screen').hidden=false;$('message').textContent='可点击画面中的按钮。';}catch(e){$('message').textContent=e.message}}
 async function action(data){try{const r=await fetch('/browser/action',{method:'POST',headers:{'Content-Type':'application/json','x-monitor-csrf':csrf},body:JSON.stringify(data)});if(!r.ok){const e=await r.json();throw Error(e.detail)}if(data.action==='close'){if(currentImage){URL.revokeObjectURL(currentImage);currentImage=null}$('screen').hidden=true;$('message').textContent='浏览器已关闭，已保存的条件和 Cookie 保留。';state()}else setTimeout(refresh,600)}catch(e){$('message').textContent=e.message}}
+async function diagnosis(){try{const r=await fetch('/browser/diagnostic');if(!r.ok)throw Error('诊断读取失败');const value=await r.json();$('diagnostic').textContent=value.text;$('failure-screen').hidden=true;if(failureImage){URL.revokeObjectURL(failureImage);failureImage=null}if(value.diagnostic?.screenshot_sha256){const picture=await fetch('/browser/diagnostic/screenshot');if(picture.ok){failureImage=URL.createObjectURL(await picture.blob());$('failure-screen').src=failureImage;$('failure-screen').hidden=false}}}catch(e){$('diagnostic').textContent=e.message}}
+$('diagnose').onclick=diagnosis;
 $('close').onclick=()=>action({action:'close'});$('refresh').onclick=refresh;$('open').onclick=()=>action({action:'open'});$('up').onclick=()=>action({action:'scroll',dy:-600});$('down').onclick=()=>action({action:'scroll',dy:600});$('type').onclick=()=>{action({action:'type',text:$('text').value});$('text').value=''};for(const [id,key] of [['enter','Enter'],['tab','Tab'],['back','Backspace']])$(id).onclick=()=>action({action:'key',key});
 $('screen').onclick=e=>{const box=e.target.getBoundingClientRect();action({action:'click',x:Math.round((e.clientX-box.left)*1280/box.width),y:Math.round((e.clientY-box.top)*900/box.height)})};state();setInterval(state,8000);
 </script></body></html>

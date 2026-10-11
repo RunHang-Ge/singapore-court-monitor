@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 import hmac
+import hashlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
+from query_diagnostics import format_failure
 from memory_usage import snapshot, log_memory
 from engine import Engine
 from scanner import Scanner, ScanError
@@ -142,3 +144,28 @@ async def browser_action(request: Request):
         raise HTTPException(409, str(error)) from None
     except Exception:
         raise HTTPException(503, '浏览器操作未完成，请刷新画面。') from None
+
+
+@app.get('/browser/diagnostic', dependencies=[Depends(admin)])
+async def diagnostic(request: Request):
+    value = request.app.state.engine.scanner.last_failure()
+    return JSONResponse({'diagnostic': value, 'text': format_failure(value, include_url=True)},
+                        headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/browser/diagnostic/screenshot', dependencies=[Depends(admin)])
+async def diagnostic_screenshot(request: Request):
+    scanner = request.app.state.engine.scanner
+    value = scanner.last_failure()
+    if not value or not value.get('screenshot_sha256'):
+        raise HTTPException(404, '本次失败未保存截图，请查看文字诊断。')
+    try:
+        path = scanner.directory / 'last-query-failure.jpg'
+        if path.stat().st_size > 750000:
+            raise ValueError()
+        image = path.read_bytes()
+        if hashlib.sha256(image).hexdigest() != value['screenshot_sha256']:
+            raise ValueError()
+    except (OSError, ValueError):
+        raise HTTPException(404, '截图暂不可用，请查看文字诊断。') from None
+    return Response(image, media_type='image/jpeg', headers={'Cache-Control': 'no-store'})

@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 from datetime import date, datetime
 import os
 import logging
@@ -7,6 +9,7 @@ from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
+from query_diagnostics import classify, safe_url, load_failure
 from memory_usage import log_memory
 from models import now_sg, slot_from_control
 
@@ -19,7 +22,9 @@ class ScanError(Exception):
 
 
 class VerificationRequired(ScanError):
-    pass
+    def __init__(self, message, diagnostic=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 class SecurityCheckPending(VerificationRequired):
@@ -64,6 +69,7 @@ class Scanner:
         self.busy = False
         self.last_manual_use = 0.0
         self.manual_idle_seconds = 120
+        self.document_response = {}
 
     @property
     def browser_active(self):
@@ -147,6 +153,8 @@ class Scanner:
                     if extra is not self.page:
                         await extra.close()
                 self.context.on('page', self.close_extra_page)
+            self.document_response = {}
+            self.page.on('response', self.observe_response)
             self.page.set_default_timeout(15000)
             log_memory('after_browser_start', True)
         except BaseException as error:
@@ -156,14 +164,81 @@ class Scanner:
             raise ScanError('云端浏览器启动失败，请检查 Chromium 安装、系统依赖和服务内存；详情见浏览器诊断。') from None
         return self.page
 
-    async def guard(self, page):
+    def observe_response(self, response):
+        # Only the main document proves what page was served; ignore subresources.
+        try:
+            request = response.request
+            if request.is_navigation_request() and request.frame == self.page.main_frame:
+                self.document_response = {
+                    'url': safe_url(response.url), 'status': response.status,
+                    'headers': {k: v[:100] for k, v in response.headers.items()
+                                if k.lower() in ('cf-mitigated', 'cf-ray', 'server')}}
+        except Exception:
+            pass
+
+    async def inspect_page(self, page):
         title = await page.title()
         text = (await page.locator('body').inner_text())[:20000]
-        if re.search(r'just a moment|performing security verification|verify (?:you are|that you)|enable javascript and cookies|checking your browser', title + '\n' + text, re.I):
-            raise SecurityCheckPending('ActiveSG 的网站安全检查尚未完成。')
-        if re.search(r'singpass|/login|/sign-in', page.url, re.I):
-            raise VerificationRequired('ActiveSG 要求登录，请在服务的浏览器页面检查。')
+        markers = await page.evaluate('''() => ({
+          challenge_options: typeof window._cf_chl_opt === 'object',
+          challenge_script: [...document.querySelectorAll('script[src]')].some(
+            n => n.src.includes('/cdn-cgi/challenge-platform/')),
+          widget: [...document.querySelectorAll('iframe[src]')].some(
+            n => {try {return new URL(n.src).hostname === 'challenges.cloudflare.com'} catch {return false}})
+        })''')
+        document = self.document_response if self.document_response.get('url') == safe_url(page.url) else {}
+        return classify(page.url, title, text, document, markers), text
+
+    async def guard(self, page):
+        diagnostic, text = await self.inspect_page(page)
+        category = diagnostic['category']
+        if category in ('cloudflare_challenge', 'cloudflare_likely', 'cloudflare_widget', 'unknown_security'):
+            raise SecurityCheckPending(diagnostic['label'] + '尚未完成。', diagnostic)
+        if category == 'login':
+            raise VerificationRequired('实际页面已跳转到 ActiveSG / Singpass 登录入口。', diagnostic)
+        if category == 'access_denied':
+            raise VerificationRequired('官网主页面拒绝访问；拦截来源尚未确认。', diagnostic)
         return text
+
+    async def save_failure(self, error):
+        # Persist a small metadata file before closing Chromium. No HTML, cookies,
+        # form values or complete headers are recorded.
+        diagnostic = getattr(error, 'diagnostic', None)
+        if diagnostic is None and self.page is not None:
+            try:
+                diagnostic, _ = await asyncio.wait_for(self.inspect_page(self.page), timeout=3)
+            except Exception:
+                pass
+        diagnostic = dict(diagnostic or {'category': 'unavailable', 'label': '未取得页面证据',
+                                        'evidence': ['页面可能未启动、已关闭或无法读取']})
+        diagnostic.update(captured_at=now_sg().isoformat(), error=str(error)[:300], screenshot_sha256=None)
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            # Never screenshot login/identity pages. Only the official facility
+            # page in a failure state is captured, and only the current viewport.
+            if self.page is not None and diagnostic['category'] in (
+                    'cloudflare_challenge', 'cloudflare_likely', 'cloudflare_widget',
+                    'unknown_security', 'access_denied', 'blank'):
+                parsed = urlparse(self.page.url)
+                if parsed.hostname == 'activesg.gov.sg' and parsed.path.startswith('/facility-bookings/'):
+                    try:
+                        image = await self.page.screenshot(type='jpeg', quality=40, timeout=5000)
+                        if len(image) <= 750000:
+                            temporary = self.directory / 'last-query-failure.jpg.tmp'
+                            temporary.write_bytes(image)
+                            temporary.replace(self.directory / 'last-query-failure.jpg')
+                            diagnostic['screenshot_sha256'] = hashlib.sha256(image).hexdigest()
+                    except Exception:
+                        diagnostic['screenshot_note'] = '截图未完成，文字诊断仍已保存'
+            temporary = self.directory / 'last-query-failure.json.tmp'
+            temporary.write_text(json.dumps(diagnostic, ensure_ascii=False), encoding='utf-8')
+            temporary.replace(self.directory / 'last-query-failure.json')
+            logging.getLogger('uvicorn.error').info('query_diagnostic=%s', json.dumps(diagnostic, ensure_ascii=False))
+        except Exception:
+            logging.getLogger('uvicorn.error').warning('Failed to persist query diagnosis.')
+
+    def last_failure(self):
+        return load_failure(self.directory)
 
     async def wait_until_ready(self, page, timeout=45, poll_interval=1):
         # A challenge page can finish its own checks and redirect automatically.
@@ -173,11 +248,12 @@ class Scanner:
         while True:
             try:
                 return await self.guard(page)
-            except SecurityCheckPending:
+            except SecurityCheckPending as error:
                 if asyncio.get_running_loop().time() >= deadline:
+                    label = (error.diagnostic or {}).get('label', '来源未确认的安全检查')
                     raise VerificationRequired(
-                        'ActiveSG 的网站安全检查等待 45 秒后仍未完成，自动查询未读取到场地数据。'
-                        '这不代表查询需要账号认证；可在服务的浏览器页面查看实际拦截页面。') from None
+                        f'{label}等待 {timeout:g} 秒后仍未完成，未读取到场地数据。'
+                        '可发送 /diagnose 查看失败时保存的证据。', error.diagnostic) from None
             except BrowserError as error:
                 # Automatic navigation can replace the execution context mid-read.
                 if 'Execution context was destroyed' not in str(error) or asyncio.get_running_loop().time() >= deadline:
@@ -210,14 +286,16 @@ class Scanner:
             self.busy = True
             try:
                 return await self._scan(config)
-            except ScanError:
+            except ScanError as error:
+                await self.save_failure(error)
                 raise
             except Exception as error:
                 from playwright.async_api import TimeoutError as BrowserTimeout
-                if isinstance(error, BrowserTimeout):
-                    raise ScanError('ActiveSG 页面加载超时；请检查网站验证以及运动和场馆名称。') from None
-                # Do not expose CDP credentials, page HTML, or request URLs in Telegram.
-                raise ScanError('ActiveSG 页面读取失败，本轮结果未采用。请检查服务浏览器页面。') from None
+                message = ('ActiveSG 页面加载超时，未采用本轮结果。' if isinstance(error, BrowserTimeout)
+                           else 'ActiveSG 页面读取失败，未采用本轮结果。')
+                failure = ScanError(message + ' 可发送 /diagnose 查看失败证据。')
+                await self.save_failure(failure)
+                raise failure from None
             finally:
                 try:
                     # Keep cookies on disk, but no Chromium/driver between queries.

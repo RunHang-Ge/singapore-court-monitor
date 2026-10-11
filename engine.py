@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 
+from query_diagnostics import format_failure
 from models import Config, now_sg, parse_dates, parse_set, parse_window, summaries
 from telegram_api import TelegramError
 
@@ -18,6 +19,7 @@ HELP = '''可用指令：
 /time 19:00-22:00（也接受 7pm-10pm）
 /status 查看条件与最近查询
 /results 返回最近一轮完整结果
+/diagnose 查看失败时保存的页面证据
 /check 立即查询一次
 /pause 暂停；/resume 恢复
 
@@ -204,6 +206,8 @@ class Engine:
                 reply = HELP
             elif command == '/status':
                 reply = self.status()
+            elif command == '/diagnose':
+                reply = format_failure(self.scanner.last_failure())
             elif command == '/results':
                 return chat, self.full_results()
             elif command == '/set':

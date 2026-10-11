@@ -201,6 +201,9 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('19:00', self.engine.config().text())
         self.assertEqual(self.engine.handle_message(message('/status@other_bot')), (None, None))
         self.assertIn('可用指令', self.engine.handle_message(message('/help'))[1][0])
+        self.scanner.last_failure = lambda: None
+        self.assertIn('尚未保存', self.engine.handle_message(message('/diagnose'))[1][0])
+        self.assertEqual(self.engine.handle_message(message('/diagnose', 999)), (None, None))
 
     async def test_binding_requires_secret(self):
         self.store.put('owner', None)
@@ -235,12 +238,17 @@ class WebTests(unittest.TestCase):
             with TestClient(app) as client:
                 self.assertEqual(client.get('/healthz').status_code, 200)
                 self.assertEqual(client.get('/').status_code, 401)
+                self.assertEqual(client.get('/browser/diagnostic').status_code, 401)
+                self.assertEqual(client.get('/browser/diagnostic/screenshot').status_code, 401)
                 auth = ('admin', 'test-password-123456')
                 self.assertEqual(client.get('/', auth=auth).status_code, 200)
                 state = client.get('/status', auth=auth).json()
                 self.assertIn('/start ', state['binding_command'])
                 self.assertIn('container_mib', state['memory'])
                 self.assertFalse(state['browser_active'])
+                self.assertIn('尚未保存', client.get('/browser/diagnostic', auth=auth).json()['text'])
+                self.assertEqual(client.get('/browser/diagnostic/screenshot', auth=auth).status_code, 404)
+                self.assertFalse(client.get('/status', auth=auth).json()['browser_active'])
                 self.assertEqual(client.post('/browser/action', auth=auth, json={'action': 'open'}).status_code, 403)
                 update = {'update_id': 123, 'message': {'text': '/help'}}
                 self.assertEqual(client.post('/telegram/webhook', json=update).status_code, 403)
@@ -345,7 +353,7 @@ class MemoryTests(unittest.TestCase):
 class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def resources(self):
         from types import SimpleNamespace
-        scanner = Scanner('.')
+        scanner = Scanner(self.enterContext(tempfile.TemporaryDirectory()))
         scanner.context = SimpleNamespace(close=AsyncMock())
         scanner.playwright = SimpleNamespace(stop=AsyncMock())
         return scanner, scanner.context, scanner.playwright
@@ -448,6 +456,102 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(scanner.browser_active)
             finally:
                 await scanner.close()
+
+
+
+class QueryDiagnosisTests(unittest.TestCase):
+    def inspect(self, title='ActiveSG', text='Tennis', headers=None, markers=None, url=None):
+        from query_diagnostics import classify
+        return classify(url or 'https://activesg.gov.sg/facility-bookings/activities',
+                        title, text, {'status': 200, 'headers': headers or {}}, markers)
+
+    def test_cf_mitigated_proves_cloudflare_challenge(self):
+        value = self.inspect(headers={'cf-mitigated': 'challenge', 'set-cookie': 'secret'})
+        self.assertEqual(value['category'], 'cloudflare_challenge')
+        self.assertNotIn('set-cookie', value['headers'])
+
+    def test_cf_ray_alone_is_not_proof_of_block(self):
+        self.assertEqual(self.inspect(headers={'cf-ray': 'sample-SIN', 'server': 'cloudflare'})['category'], 'page_loaded')
+
+    def test_unidentified_check_and_blank_are_distinct(self):
+        self.assertEqual(self.inspect('Just a moment...', 'Performing security verification')['category'], 'unknown_security')
+        self.assertEqual(self.inspect('', '')['category'], 'blank')
+
+    def test_cloudflare_dom_markers_and_embedded_widget_are_distinct(self):
+        self.assertEqual(self.inspect('Just a moment...', 'Checking your browser',
+                                     markers={'challenge_options': True})['category'], 'cloudflare_challenge')
+        self.assertEqual(self.inspect('Verify you are human', 'Verify you are human',
+                                     markers={'widget': True})['category'], 'cloudflare_widget')
+        self.assertEqual(self.inspect('Just a moment...', 'Cloudflare verification')['category'], 'cloudflare_likely')
+
+    def test_login_requires_actual_login_path_or_singpass_domain(self):
+        value = self.inspect(url='https://login.singpass.gov.sg/?code=secret')
+        self.assertEqual(value['category'], 'login')
+        value = self.inspect(text='Log in with Singpass',
+                             url='https://activesg.gov.sg/facility-bookings/activities?next=/login')
+        self.assertEqual(value['category'], 'page_loaded')
+        self.assertNotIn('next', value['url'])
+
+    def test_scripts_on_normal_page_are_not_challenge_proof(self):
+        self.assertEqual(self.inspect(markers={'challenge_script': True})['category'], 'page_loaded')
+
+    def test_diagnostic_urls_strip_credentials_queries_and_fragments(self):
+        from query_diagnostics import safe_url
+        self.assertEqual(safe_url('https://admin:secret@activesg.gov.sg/facility-bookings/activities?token=secret#secret'),
+                         'https://activesg.gov.sg/facility-bookings/activities')
+
+
+class FailureEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_actual_response_and_failure_image_are_saved_before_cleanup(self):
+        from playwright.async_api import async_playwright
+        from query_diagnostics import format_failure
+        import hashlib
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        async with async_playwright() as driver:
+            browser = await driver.chromium.launch(headless=True)
+            scanner = Scanner(directory)
+            scanner.page = page = await browser.new_page()
+            page.on('response', scanner.observe_response)
+            async def challenge(route):
+                await route.fulfill(status=403, headers={'cf-mitigated': 'challenge',
+                                                        'cf-ray': 'test-SIN',
+                                                        'set-cookie': 'must-not-be-saved=secret'},
+                                    content_type='text/html',
+                                    body='<title>Just a moment...</title><p>Performing security verification</p>')
+            await page.route('https://activesg.gov.sg/**', challenge)
+            async def query(config):
+                await page.goto('https://activesg.gov.sg/facility-bookings/activities')
+                await scanner.wait_until_ready(page, timeout=0.03, poll_interval=0.01)
+            scanner._scan = query
+            try:
+                with self.assertRaisesRegex(VerificationRequired, 'Cloudflare'):
+                    await scanner.scan(config())
+                self.assertIsNone(scanner.page)
+                value = scanner.last_failure()
+                self.assertEqual(value['category'], 'cloudflare_challenge')
+                self.assertEqual(value['http_status'], 403)
+                self.assertEqual(value['headers']['cf-mitigated'], 'challenge')
+                self.assertNotIn('set-cookie', value['headers'])
+                image = (Path(directory) / 'last-query-failure.jpg').read_bytes()
+                self.assertEqual(hashlib.sha256(image).hexdigest(), value['screenshot_sha256'])
+                self.assertNotIn('https://', format_failure(value))
+                scanner.ensure_page = AsyncMock(side_effect=AssertionError('must not reopen browser'))
+                self.assertEqual(scanner.last_failure(), value)
+                scanner.ensure_page.assert_not_awaited()
+            finally:
+                await browser.close()
+
+    async def test_login_page_is_never_screenshotted(self):
+        from types import SimpleNamespace
+        from query_diagnostics import classify
+        with tempfile.TemporaryDirectory() as directory:
+            scanner = Scanner(directory)
+            screenshot = AsyncMock()
+            scanner.page = SimpleNamespace(url='https://activesg.gov.sg/login', screenshot=screenshot)
+            value = classify(scanner.page.url, 'Log in', 'Log in using Singpass')
+            await scanner.save_failure(VerificationRequired('Login required', value))
+            screenshot.assert_not_awaited()
+            self.assertIsNone(scanner.last_failure()['screenshot_sha256'])
 
 
 if __name__ == '__main__':

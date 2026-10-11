@@ -1,0 +1,93 @@
+"""Classify observed pages without treating CDN headers as proof of a challenge."""
+import json
+import re
+from pathlib import Path
+from urllib.parse import urlparse
+
+LABELS = {
+    'cloudflare_challenge': 'Cloudflare 的整页安全检查（已确认）',
+    'cloudflare_likely': '疑似 Cloudflare 安全检查（尚未确认）',
+    'cloudflare_widget': '网站页面内的 Cloudflare 验证组件',
+    'login': 'ActiveSG / Singpass 登录页面',
+    'unknown_security': '安全检查页面，来源尚未确认',
+    'access_denied': '访问被拒绝，拦截来源尚未确认',
+    'blank': '页面为空白，不能判定为安全验证',
+    'page_loaded': '页面已有内容，未发现明确安全检查标记',
+    'unavailable': '未取得页面证据',
+}
+
+
+def safe_url(url):
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return 'about:blank' if url == 'about:blank' else '未取得网址'
+    # Strip credentials, query parameters and fragments, including login codes.
+    return (parsed.scheme + '://' + parsed.hostname + parsed.path)[:500]
+
+
+def classify(url, title, text, document=None, markers=None):
+    document, markers = document or {}, markers or {}
+    headers = {k.lower(): str(v)[:100] for k, v in document.get('headers', {}).items()
+               if k.lower() in ('cf-mitigated', 'cf-ray', 'server')}
+    status = document.get('status')
+    evidence = []
+    security = bool(re.search(
+        r'performing security verification|verify (?:you are|that you)|enable javascript and cookies|checking your browser',
+        text, re.I) or re.search(r'just a moment|security verification', title, re.I))
+    host = urlparse(url).hostname or ''
+    path = urlparse(url).path
+    if headers.get('cf-mitigated', '').lower() == 'challenge':
+        category = 'cloudflare_challenge'
+        evidence.append('主页面响应包含 cf-mitigated: challenge')
+    elif security and markers.get('challenge_options'):
+        category = 'cloudflare_challenge'
+        evidence.append('检查页面包含 Cloudflare _cf_chl_opt 标记')
+    elif host == 'singpass.gov.sg' or host.endswith('.singpass.gov.sg') or re.search(r'/(?:login|sign-in)(?:/|$)', path, re.I):
+        category = 'login'
+        evidence.append('实际跳转到登录网址')
+    elif security and markers.get('widget'):
+        category = 'cloudflare_widget'
+        evidence.append('检查页面包含 challenges.cloudflare.com 验证框')
+    elif security and (markers.get('challenge_script') or re.search(r'cloudflare', title + '\n' + text, re.I)):
+        category = 'cloudflare_likely'
+        evidence.append('检查文字与 Cloudflare 页面标记同时出现，但未取得确认标记')
+    elif security:
+        category = 'unknown_security'
+        evidence.append('发现检查文字，未发现能确认提供方的标记')
+    elif status in (401, 403, 429):
+        category = 'access_denied'
+        evidence.append('主页面响应 HTTP ' + str(status))
+    elif not text.strip():
+        category = 'blank'
+        evidence.append('当前页面没有可见正文')
+    else:
+        category = 'page_loaded'
+        evidence.append('没有明确的整页安全检查或登录标记')
+    # CF-Ray and Server: cloudflare alone indicate CDN delivery, not a challenge.
+    return {'category': category, 'label': LABELS[category], 'url': safe_url(url),
+            'title': title[:160], 'http_status': status, 'headers': headers, 'evidence': evidence}
+
+
+def load_failure(directory):
+    try:
+        value = json.loads((Path(directory) / 'last-query-failure.json').read_text(encoding='utf-8'))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def format_failure(value, include_url=False):
+    if not value:
+        return '尚未保存查询失败证据。部署此版本后，请先进行一次查询。'
+    lines = ['最近一次失败：' + value.get('captured_at', '未知时间'),
+             '判断：' + value.get('label', LABELS['unavailable']),
+             '页面标题：' + (value.get('title') or '空白 / 未取得'),
+             '主页面 HTTP：' + str(value.get('http_status') or '未取得')]
+    lines.extend('证据：' + item for item in value.get('evidence', []))
+    if value.get('headers', {}).get('cf-ray'):
+        lines.append('Cloudflare 请求编号：' + value['headers']['cf-ray'])
+    if include_url:
+        lines.append('页面来源：' + value.get('url', '未取得'))
+    lines.append('说明：' + value.get('error', ''))
+    lines.append('这是失败时保存的证据；本指令不会重新访问官网。')
+    return '\n'.join(lines)
