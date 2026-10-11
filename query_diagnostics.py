@@ -86,6 +86,30 @@ def format_failure(value, include_url=False):
     lines.extend('证据：' + item for item in value.get('evidence', []))
     if value.get('headers', {}).get('cf-ray'):
         lines.append('Cloudflare 请求编号：' + value['headers']['cf-ray'])
+    step = value.get('step')
+    if isinstance(step, dict):
+        lines.append('操作阶段：' + str(step.get('stage', '未知'))[:100])
+        lines.append('等待步骤：' + str(step.get('operation', '未知'))[:100])
+        if step.get('target'):
+            lines.append('操作目标：' + str(step['target'])[:200])
+        if step.get('date'):
+            lines.append('查询日期：' + str(step['date'])[:20])
+        lines.append('该阶段已耗时：' + str(step.get('elapsed_seconds', '未知')) + ' 秒')
+        if step.get('timeout_seconds') is not None:
+            lines.append('此步骤等待上限：' + str(step['timeout_seconds']) + ' 秒')
+        if 'clicked' in step:
+            lines.append('按钮点击：' + ('已完成' if step['clicked'] else '尚未完成'))
+        if step.get('timeout_reason'):
+            lines.append('超时线索：' + str(step['timeout_reason'])[:100])
+        if 'browser_seconds_remaining' in step:
+            lines.append('远程浏览器剩余时间：' + str(step['browser_seconds_remaining']) + ' 秒')
+        page = step.get('page', {})
+        if page:
+            lines.append('页面控件：日期按钮 ' + str(page.get('date_buttons', 0)) +
+                         '；时段控件 ' + str(page.get('slot_controls', 0)) +
+                         '；可见弹窗 ' + str(page.get('dialogs', 0)))
+            if page.get('headings'):
+                lines.append('页面标题文字：' + '、'.join(str(n)[:80] for n in page['headings'][:6]))
     lookup = value.get('lookup')
     if isinstance(lookup, dict):
         label = '场馆' if lookup.get('kind') == 'venue' else '运动项目'

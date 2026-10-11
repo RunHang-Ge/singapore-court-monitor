@@ -64,6 +64,7 @@ class Scanner:
         self.lock = asyncio.Lock()
         self.playwright = self.browser = self.context = self.page = None
         self.busy = False
+        self.progress = {}
         self.last_manual_use = 0.0
         self.manual_idle_seconds = 120
         self.document_response = {}
@@ -72,6 +73,42 @@ class Scanner:
         self.handoff = None
         self.on_human = None
         self.is_current = lambda: True
+
+    def mark_step(self, stage, target='', day=None):
+        self.progress = {'stage': stage, 'target': target[:200], 'date': day,
+                         'started': time.monotonic(), 'operation': stage}
+
+    def mark_operation(self, operation, timeout=None, **details):
+        if not self.progress:
+            self.mark_step('页面操作')
+        self.progress.update(operation=operation, timeout_seconds=timeout, **details)
+
+    async def progress_evidence(self, diagnostic):
+        if not self.progress:
+            return None
+        step = {key: value for key, value in self.progress.items() if key != 'started'}
+        step['elapsed_seconds'] = round(max(0, time.monotonic() - self.progress['started']), 1)
+        if self.remote_deadline:
+            step['browser_seconds_remaining'] = round(max(0, self.remote_deadline - time.monotonic()), 1)
+        # Only small public-page UI observations. Never save cookies, fields,
+        # complete Playwright errors (which can contain connection credentials),
+        # or private viewer URLs.
+        if self.page is not None and diagnostic.get('category') == 'page_loaded':
+            parsed = urlparse(self.page.url)
+            if parsed.hostname == 'activesg.gov.sg' and parsed.path.startswith('/facility-bookings/'):
+                try:
+                    step['page'] = await asyncio.wait_for(self.page.evaluate(r"""() => ({
+                      date_buttons: document.querySelectorAll('[aria-label^="View timeslots for"]').length,
+                      slot_controls: document.querySelectorAll('input[type="checkbox"]').length,
+                      dialogs: [...document.querySelectorAll('dialog,[role="dialog"],[aria-modal="true"]')]
+                        .filter(n => n.getClientRects().length).length,
+                      headings: [...document.querySelectorAll('h1,h2,h3,[role="heading"]')]
+                        .filter(n => n.getClientRects().length)
+                        .map(n => (n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80)).slice(0, 6)
+                    })"""), timeout=2)
+                except Exception:
+                    pass
+        return step
 
     @property
     def browser_active(self):
@@ -225,6 +262,9 @@ class Scanner:
                 pass
         diagnostic = dict(diagnostic or {'category': 'unavailable', 'label': '未取得页面证据',
                                         'evidence': ['页面可能未启动、已关闭或无法读取']})
+        step = await self.progress_evidence(diagnostic)
+        if step:
+            diagnostic['step'] = step
         diagnostic.update(captured_at=now_sg().isoformat(), error=str(error)[:300], screenshot_sha256=None)
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
@@ -232,7 +272,7 @@ class Scanner:
             # page in a failure state is captured, and only the current viewport.
             if self.page is not None and diagnostic['category'] in (
                     'cloudflare_challenge', 'cloudflare_likely', 'cloudflare_widget',
-                    'unknown_security', 'access_denied', 'blank'):
+                    'unknown_security', 'access_denied', 'blank', 'page_loaded'):
                 parsed = urlparse(self.page.url)
                 if parsed.hostname == 'activesg.gov.sg' and parsed.path.startswith('/facility-bookings/'):
                     try:
@@ -376,12 +416,11 @@ class Scanner:
             await asyncio.sleep(poll_interval)
 
     async def goto(self, page, url):
-        await page.goto(official_url(url), wait_until='domcontentloaded', timeout=45000)
-        await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
-        try:
-            await page.wait_for_load_state('networkidle', timeout=2000 if self.remote_deadline else 10000)
-        except Exception:
-            pass
+        # Start the document; find_link/select_day/read_slot_controls wait for
+        # their actual content, independently of unrelated images and scripts.
+        self.mark_operation('打开活动页', timeout=45)
+        await page.goto(official_url(url), wait_until='commit', timeout=45000)
+        self.mark_operation('读取活动页', timeout=15)
         return await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
 
     async def find_link(self, page, name, kind='activity', timeout=12, poll_interval=0.5):
@@ -470,6 +509,7 @@ class Scanner:
             raise ScanError('浏览器正在处理其他操作，请稍后重试。')
         async with self.lock:
             self.busy = True
+            self.mark_step('启动浏览器')
             try:
                 return await self._scan(config)
             except ScanError as error:
@@ -477,8 +517,18 @@ class Scanner:
                 raise
             except Exception as error:
                 from playwright.async_api import TimeoutError as BrowserTimeout
-                message = ('ActiveSG 页面加载超时，未采用本轮结果。' if isinstance(error, BrowserTimeout)
-                           else 'ActiveSG 页面读取失败，未采用本轮结果。')
+                operation = self.progress.get('operation', '读取页面')
+                if isinstance(error, BrowserTimeout):
+                    # Classify known actionability hints, never retain raw errors.
+                    clues = str(error).lower()
+                    reason = ('其他页面元素挡住按钮' if 'intercepts pointer events' in clues else
+                              '按钮尚不可见' if 'not visible' in clues else
+                              '按钮尚不稳定' if 'not stable' in clues else
+                              '在限定时间内未完成此步骤')
+                    self.progress['timeout_reason'] = reason
+                    message = f'ActiveSG 操作超时：{operation}；{reason}，未采用本轮结果。'
+                else:
+                    message = f'ActiveSG 页面读取失败（{operation}），未采用本轮结果。'
                 failure = ScanError(message + ' 可发送 /diagnose 查看失败证据。')
                 await self.save_failure(failure)
                 raise failure from None
@@ -490,17 +540,27 @@ class Scanner:
                     self.busy = False
                     self.remote_deadline = 0.0
                     self.handoff = None
+                    self.progress = {}
 
-    async def click_link(self, page, destination):
-        # Click the actual card so the site's navigation handlers run.
+    async def click_link(self, page, destination, timeout=15):
+        # Click the actual visible card; responsive pages may contain hidden
+        # copies with the same href before the visible one.
         destination = official_url(destination)
         links = await page.locator('a[href]').evaluate_all(
             "nodes => nodes.map(n => ({href:n.href, raw:n.getAttribute('href')}))")
         for link in links:
             if link['href'] == destination:
-                target = page.locator('a[href=' + json.dumps(link['raw']) + ']').first
-                await target.click(timeout=15000)
-                await page.wait_for_url(lambda url: safe_url(str(url)) == safe_url(destination), timeout=15000)
+                target = page.locator('a[href=' + json.dumps(link['raw']) + ']:visible').first
+                self.mark_operation('点击' + (self.progress.get('target') or '页面按钮'),
+                                    timeout=timeout, clicked=False)
+                await target.click(timeout=timeout * 1000, no_wait_after=True)
+                self.mark_operation('等待点击后的页面切换', timeout=timeout, clicked=True)
+                # Confirm the route, then let the next reader wait for the
+                # required UI. Waiting for load would also wait for every image.
+                await page.wait_for_function(r"""expected =>
+                    location.origin + location.pathname.replace(/\/$/, '') === expected
+                """, arg=safe_url(destination).rstrip('/'), timeout=timeout * 1000)
+                self.mark_operation('读取点击后的页面', timeout=15)
                 return await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
         raise ScanError('场馆或运动项目按钮已变化，本轮未采用。')
 
@@ -509,6 +569,7 @@ class Scanner:
         deadline = time.monotonic() + timeout
         if self.remote_deadline:
             deadline = min(deadline, self.remote_deadline - 15)
+        self.mark_operation('查找日期按钮', timeout=timeout)
         locator = page.locator('[aria-label^="View timeslots for"]')
         buttons = []
         while True:
@@ -529,7 +590,9 @@ class Scanner:
                 if button['disabled']:
                     return False
                 if not button['selected']:
-                    await locator.nth(index).click(timeout=10000)
+                    self.mark_operation('点击日期按钮', timeout=10, clicked=False)
+                    await locator.nth(index).click(timeout=10000, no_wait_after=True)
+                    self.progress['clicked'] = True
                 break
             if len(hits) > 1:
                 raise ScanError('日期按钮不唯一，本轮未采用。')
@@ -538,6 +601,7 @@ class Scanner:
                     return False
                 raise ScanError('没有读取到日期按钮，本轮未采用。')
             await asyncio.sleep(poll_interval)
+        self.mark_operation('确认选中的日期', timeout=timeout)
         while True:
             await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
             buttons = await locator.evaluate_all("""nodes => nodes.map(n => ({
@@ -562,6 +626,7 @@ class Scanner:
         deadline = time.monotonic() + timeout
         if self.remote_deadline:
             deadline = min(deadline, self.remote_deadline - 15)
+        self.mark_operation('等待本日时段及分组加载', timeout=timeout)
         snapshot, active, unknown, stale = {}, [], [], 0
         while True:
             if not self.is_current():
@@ -610,15 +675,21 @@ class Scanner:
 
     async def _scan(self, config):
         page = await self.ensure_page()
+        self.mark_step('打开运动项目列表')
         await self.goto(page, ACTIVITIES)
+        self.mark_step('查找运动项目', target=config.activity)
         activity_link = await self.find_link(page, config.activity)
+        self.mark_step('进入运动项目的场馆列表', target=config.activity)
         await self.click_link(page, activity_link)
+        self.mark_step('查找场馆', target=config.venue)
         venue_link = await self.find_link(page, config.venue, kind='venue')
+        self.mark_step('进入场馆时段页', target=config.venue)
         await self.click_link(page, venue_link)
         results, found = [], {}
         for day in config.days():
             if not self.is_current():
                 raise ScanError('本轮查询已取消。')
+            self.mark_step('选择日期', target=config.venue, day=day)
             if not await self.select_day(page, day):
                 results.append({'date': day, 'status': 'not_selectable'})
                 continue
@@ -632,6 +703,7 @@ class Scanner:
                 raise ScanError('官网场馆与监控条件不一致，本次查询不采用。')
             if 'Each slot is 1 hour long' not in text:
                 raise ScanError('官网一小时预约分组无法确认，本次查询不采用。')
+            self.mark_step('读取可选时段', target=config.venue, day=day)
             controls = await self.read_slot_controls(page, day)
             instant = [c for c in controls if c['bookingType'] == 'instant']
             for control in instant:
