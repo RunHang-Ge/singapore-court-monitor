@@ -237,7 +237,10 @@ class WebTests(unittest.TestCase):
                 self.assertEqual(client.get('/').status_code, 401)
                 auth = ('admin', 'test-password-123456')
                 self.assertEqual(client.get('/', auth=auth).status_code, 200)
-                self.assertIn('/start ', client.get('/status', auth=auth).json()['binding_command'])
+                state = client.get('/status', auth=auth).json()
+                self.assertIn('/start ', state['binding_command'])
+                self.assertIn('container_mib', state['memory'])
+                self.assertFalse(state['browser_active'])
                 self.assertEqual(client.post('/browser/action', auth=auth, json={'action': 'open'}).status_code, 403)
                 update = {'update_id': 123, 'message': {'text': '/help'}}
                 self.assertEqual(client.post('/telegram/webhook', json=update).status_code, 403)
@@ -302,6 +305,149 @@ class BrowserFixtureTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(VerificationRequired):
                 await scanner.guard(page)
             await browser.close()
+
+
+
+class MemoryTests(unittest.TestCase):
+    def test_container_total_limit_and_python_are_distinct(self):
+        from memory_usage import snapshot
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, value in [('memory.current', 300 * 1024 ** 2),
+                                ('memory.max', 512 * 1024 ** 2),
+                                ('memory.peak', 450 * 1024 ** 2)]:
+                (root / name).write_text(str(value))
+            (root / 'memory.events').write_text('oom 1\noom_kill 1\n')
+            (root / 'process').write_text('VmRSS:   51200 kB\n')
+            self.assertEqual(snapshot(root, root / 'process'),
+                             {'container_mib': 300.0, 'limit_mib': 512.0,
+                              'peak_mib': 450.0, 'python_mib': 50.0, 'oom_kills': 1})
+
+    def test_missing_and_unlimited_metrics_do_not_break_service(self):
+        from memory_usage import snapshot
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'memory.max').write_text('max')
+            self.assertTrue(all(value is None for value in snapshot(root, root / 'missing').values()))
+
+    def test_cgroup_v1_fallback(self):
+        from memory_usage import snapshot
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'memory').mkdir()
+            (root / 'memory' / 'memory.usage_in_bytes').write_text(str(200 * 1024 ** 2))
+            (root / 'memory' / 'memory.limit_in_bytes').write_text(str(2 ** 63 - 4096))
+            values = snapshot(root, root / 'missing')
+            self.assertEqual(values['container_mib'], 200.0)
+            self.assertIsNone(values['limit_mib'])
+
+
+class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def resources(self):
+        from types import SimpleNamespace
+        scanner = Scanner('.')
+        scanner.context = SimpleNamespace(close=AsyncMock())
+        scanner.playwright = SimpleNamespace(stop=AsyncMock())
+        return scanner, scanner.context, scanner.playwright
+
+    async def test_query_success_error_and_cancellation_all_release(self):
+        for failure in [None, ScanError('unavailable'), asyncio.CancelledError()]:
+            with self.subTest(failure=type(failure).__name__):
+                scanner, context, driver = self.resources()
+                expected = result([])
+                scanner._scan = AsyncMock(return_value=expected, side_effect=failure)
+                if failure is None:
+                    self.assertEqual(await scanner.scan(config()), expected)
+                else:
+                    with self.assertRaises(type(failure)):
+                        await scanner.scan(config())
+                context.close.assert_awaited_once()
+                driver.stop.assert_awaited_once()
+                self.assertIsNone(scanner.context)
+                self.assertIsNone(scanner.playwright)
+                self.assertFalse(scanner.busy)
+
+    async def test_driver_stops_even_if_context_cleanup_fails(self):
+        scanner, context, driver = self.resources()
+        context.close.side_effect = RuntimeError('closed process')
+        await scanner.close()
+        driver.stop.assert_awaited_once()
+        self.assertFalse(scanner.browser_active)
+
+    async def test_idle_cleanup_keeps_recent_manual_session_and_active_query(self):
+        import time
+        scanner, context, driver = self.resources()
+        scanner.last_manual_use = time.monotonic()
+        await scanner.release_if_idle()
+        context.close.assert_not_awaited()
+        scanner.last_manual_use -= 121
+        async with scanner.lock:
+            await scanner.release_if_idle()
+        context.close.assert_not_awaited()
+        await scanner.release_if_idle()
+        context.close.assert_awaited_once()
+        driver.stop.assert_awaited_once()
+
+    async def test_manual_close_never_reopens_browser(self):
+        scanner, context, driver = self.resources()
+        scanner.ensure_page = AsyncMock()
+        await scanner.action('close', {})
+        scanner.ensure_page.assert_not_awaited()
+        context.close.assert_awaited_once()
+
+    async def test_cdp_disconnect_does_not_close_borrowed_context(self):
+        from types import SimpleNamespace
+        scanner, context, driver = self.resources()
+        browser = scanner.browser = SimpleNamespace(close=AsyncMock())
+        await scanner.close()
+        browser.close.assert_awaited_once()
+        context.close.assert_not_awaited()
+        driver.stop.assert_awaited_once()
+
+    async def test_stale_context_and_failed_launch_release_drivers(self):
+        from types import SimpleNamespace
+        scanner, old_context, old_driver = self.resources()
+        scanner.page = SimpleNamespace(is_closed=lambda: True)
+        new_driver = SimpleNamespace(
+            chromium=SimpleNamespace(launch_persistent_context=AsyncMock(side_effect=RuntimeError('failed'))),
+            stop=AsyncMock())
+        factory = SimpleNamespace(start=AsyncMock(return_value=new_driver))
+        with tempfile.TemporaryDirectory() as directory:
+            scanner.directory = Path(directory)
+            with patch('playwright.async_api.async_playwright', return_value=factory), patch.dict(os.environ, {'BROWSER_CDP_URL': ''}):
+                with self.assertRaises(ScanError):
+                    await scanner.ensure_page()
+        old_context.close.assert_awaited_once()
+        old_driver.stop.assert_awaited_once()
+        new_driver.stop.assert_awaited_once()
+        self.assertIsNone(scanner.playwright)
+
+    async def test_real_browser_closes_and_cookies_survive_next_query(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'BROWSER_CDP_URL': '', 'BROWSER_HEADLESS': 'true'}):
+            scanner = Scanner(directory)
+            pages = []
+            async def query(config):
+                page = await scanner.ensure_page()
+                pages.append(page)
+                cookies = await scanner.context.cookies('https://activesg.gov.sg')
+                if len(pages) == 1:
+                    await scanner.context.add_cookies([{'name': 'monitor_test', 'value': 'saved',
+                                                       'domain': 'activesg.gov.sg', 'path': '/',
+                                                       'expires': __import__('time').time() + 3600}])
+                else:
+                    self.assertTrue(any(item['name'] == 'monitor_test' for item in cookies))
+                await page.set_content('<p>offline lifecycle fixture</p>')
+                return result([])
+            scanner._scan = query
+            try:
+                await scanner.scan(config())
+                self.assertTrue(pages[0].is_closed())
+                self.assertIsNone(scanner.playwright)
+                await scanner.scan(config())
+                self.assertTrue(pages[1].is_closed())
+                self.assertFalse(scanner.browser_active)
+            finally:
+                await scanner.close()
 
 
 if __name__ == '__main__':

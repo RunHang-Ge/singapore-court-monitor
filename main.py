@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 import hmac
 import json
@@ -11,6 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
+from memory_usage import snapshot, log_memory
 from engine import Engine
 from scanner import Scanner, ScanError
 from storage import Store
@@ -40,10 +42,14 @@ async def lifespan(app):
                               os.getenv('TELEGRAM_MODE', 'webhook'), os.getenv('BINDING_CODE', ''))
     app.state.password = password
     app.state.csrf = secrets.token_urlsafe(32)
+    log_memory('startup')
     app.state.engine.start()
+    maintenance = asyncio.create_task(app.state.engine.scanner.maintenance())
     try:
         yield
     finally:
+        maintenance.cancel()
+        await asyncio.gather(maintenance, return_exceptions=True)
         await app.state.engine.close()
 
 
@@ -106,6 +112,7 @@ async def status(request: Request):
     return {'text': engine.status(), 'telegram_connected': engine.ready,
             'connection_error': engine.connection_error, 'bound': bool(engine.store.get('owner')),
             'browser_busy': engine.scanner.busy,
+            'browser_active': engine.scanner.browser_active, 'memory': snapshot(),
             'binding_command': '/start ' + engine.binding_code if not engine.store.get('owner') else None,
             'persistent_disk_configured': os.getenv('DATA_DIR', '').startswith('/var/data')}
 

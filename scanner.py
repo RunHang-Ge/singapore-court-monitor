@@ -1,10 +1,13 @@
 import asyncio
 from datetime import date, datetime
 import os
+import logging
+import time
 from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
+from memory_usage import log_memory
 from models import now_sg, slot_from_control
 
 BASE = 'https://activesg.gov.sg'
@@ -59,14 +62,69 @@ class Scanner:
         self.lock = asyncio.Lock()
         self.playwright = self.browser = self.context = self.page = None
         self.busy = False
+        self.last_manual_use = 0.0
+        self.manual_idle_seconds = 120
+
+    @property
+    def browser_active(self):
+        return self.context is not None or self.browser is not None
+
+    async def release_browser(self):
+        # Caller holds the browser lock. CDP only disconnects; its borrowed
+        # context and pages belong to the external browser and are never closed.
+        browser, context, driver = self.browser, self.context, self.playwright
+        self.browser = self.context = self.page = self.playwright = None
+        self.last_manual_use = 0.0
+        try:
+            if browser is not None:
+                await asyncio.wait_for(browser.close(), timeout=10)
+            elif context is not None:
+                await asyncio.wait_for(context.close(), timeout=10)
+        except Exception:
+            logging.getLogger('uvicorn.error').warning('Browser cleanup did not complete; stopping its driver.')
+        finally:
+            if driver is not None:
+                try:
+                    await asyncio.wait_for(driver.stop(), timeout=10)
+                except Exception:
+                    logging.getLogger('uvicorn.error').warning('Browser driver cleanup did not complete.')
+            if browser is not None or context is not None or driver is not None:
+                log_memory('browser_released')
+
+    async def release_if_idle(self):
+        # A query or interaction owns this lock; never interrupt it for idle cleanup.
+        if self.lock.locked() or not self.browser_active or not self.last_manual_use:
+            return
+        async with self.lock:
+            if self.last_manual_use and time.monotonic() - self.last_manual_use >= self.manual_idle_seconds:
+                await self.release_browser()
+
+    async def maintenance(self):
+        next_log = 0.0
+        while True:
+            await self.release_if_idle()
+            if time.monotonic() >= next_log:
+                log_memory('periodic', self.browser_active)
+                next_log = time.monotonic() + 30
+            await asyncio.sleep(5)
+
+    async def close_extra_page(self, page):
+        # Local contexts only. Closing the context can race a popup close event.
+        try:
+            if page is not self.page:
+                await page.close()
+        except Exception:
+            pass
 
     async def ensure_page(self):
         if self.page and not self.page.is_closed():
             return self.page
+        # Dispose stale contexts before replacing them, including partial launches.
+        await self.release_browser()
         from playwright.async_api import async_playwright
-        if self.playwright is None:
-            self.playwright = await async_playwright().start()
+        log_memory('before_browser_start')
         try:
+            self.playwright = await async_playwright().start()
             endpoint = os.getenv('BROWSER_CDP_URL', '')
             if endpoint:
                 self.browser = await self.playwright.chromium.connect_over_cdp(endpoint, timeout=20000)
@@ -84,10 +142,17 @@ class Scanner:
                     viewport={'width': 1280, 'height': 900}, locale='en-SG', timezone_id='Asia/Singapore',
                     args=['--disable-dev-shm-usage'])
                 self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+                # A saved local profile may restore extra tabs. Keep one local tab.
+                for extra in list(self.context.pages):
+                    if extra is not self.page:
+                        await extra.close()
+                self.context.on('page', self.close_extra_page)
             self.page.set_default_timeout(15000)
-        except ScanError:
-            raise
-        except Exception:
+            log_memory('after_browser_start', True)
+        except BaseException as error:
+            await self.release_browser()
+            if isinstance(error, (ScanError, asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
             raise ScanError('云端浏览器启动失败，请检查 Chromium 安装、系统依赖和服务内存；详情见浏览器诊断。') from None
         return self.page
 
@@ -154,7 +219,11 @@ class Scanner:
                 # Do not expose CDP credentials, page HTML, or request URLs in Telegram.
                 raise ScanError('ActiveSG 页面读取失败，本轮结果未采用。请检查服务浏览器页面。') from None
             finally:
-                self.busy = False
+                try:
+                    # Keep cookies on disk, but no Chromium/driver between queries.
+                    await self.release_browser()
+                finally:
+                    self.busy = False
 
     async def _scan(self, config):
         page = await self.ensure_page()
@@ -214,15 +283,23 @@ class Scanner:
             raise ScanError('正在查询，查询完成后可查看浏览器。')
         async with self.lock:
             page = await self.ensure_page()
+            self.last_manual_use = time.monotonic()
             if page.url == 'about:blank':
                 await page.goto(ACTIVITIES, wait_until='domcontentloaded', timeout=45000)
-            return await page.screenshot(type='jpeg', quality=75)
+            try:
+                return await page.screenshot(type='jpeg', quality=60)
+            finally:
+                self.last_manual_use = time.monotonic()
 
     async def action(self, action, data):
         if self.lock.locked():
             raise ScanError('正在查询，请先 /pause 并等本轮结束。')
         async with self.lock:
+            if action == 'close':
+                await self.release_browser()
+                return
             page = await self.ensure_page()
+            self.last_manual_use = time.monotonic()
             if action == 'open':
                 await page.goto(ACTIVITIES, wait_until='domcontentloaded', timeout=45000)
             else:
@@ -246,10 +323,5 @@ class Scanner:
                     raise ValueError('操作无效。')
 
     async def close(self):
-        if self.browser:
-            await self.browser.close()
-        elif self.context:
-            await self.context.close()
-        if self.playwright:
-            await self.playwright.stop()
-        self.browser = self.context = self.page = self.playwright = None
+        async with self.lock:
+            await self.release_browser()
