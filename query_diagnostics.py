@@ -97,6 +97,14 @@ def format_failure(value, include_url=False):
         lines.append('该阶段已耗时：' + str(step.get('elapsed_seconds', '未知')) + ' 秒')
         if step.get('timeout_seconds') is not None:
             lines.append('此步骤等待上限：' + str(step['timeout_seconds']) + ' 秒')
+        if 'search_scroll_steps' in step:
+            lines.append('滚动查找：' + str(step['search_scroll_steps']) + ' 次；累计 ' +
+                         str(step.get('search_scroll_distance', 0)) + ' 像素')
+            lines.append('列表是否已滚动到底：' + ('是' if step.get('search_at_bottom') else '否'))
+        if 'target_scrolled' in step:
+            lines.append('滚动到目标按钮：' + ('已完成' if step['target_scrolled'] else '尚未完成'))
+        if 'target_in_view' in step:
+            lines.append('目标按钮是否进入画面：' + ('是' if step['target_in_view'] else '否'))
         if 'clicked' in step:
             lines.append('按钮点击：' + ('已完成' if step['clicked'] else '尚未完成'))
         if step.get('timeout_reason'):

@@ -16,6 +16,7 @@ from remote_browser import RemoteProfile, RemoteBrowserError, provider, live_url
 from memory_usage import log_memory
 from models import now_sg, slot_from_control, SG
 from slot_reader import READ_SLOTS
+from page_scrolling import SCROLL_LIST, TARGET_POSITION
 
 BASE = 'https://activesg.gov.sg'
 ACTIVITIES = BASE + '/facility-bookings/activities'
@@ -423,6 +424,21 @@ class Scanner:
         self.mark_operation('读取活动页', timeout=15)
         return await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
 
+    async def scroll_search(self, page, reset=False):
+        if not self.is_current():
+            raise ScanError('本轮查询已取消。')
+        if not self.progress:
+            self.mark_step('查找页面按钮')
+        official_url(page.url)
+        # Search may need to reveal cards that do not exist before scrolling.
+        state = await page.evaluate(SCROLL_LIST, reset)
+        if not reset:
+            self.progress['search_scroll_steps'] = self.progress.get('search_scroll_steps', 0) + 1
+            self.progress['search_scroll_distance'] = self.progress.get('search_scroll_distance', 0) + state['distance']
+        self.progress['scrollable_panels'] = state['containers']
+        self.progress['search_at_bottom'] = state['at_bottom']
+        return state
+
     async def find_link(self, page, name, kind='activity', timeout=12, poll_interval=0.5):
         # Framework navigation can leave a document with headings but no cards
         # yet. Match exact names in card headings/accessible labels, not arbitrary
@@ -442,7 +458,8 @@ class Scanner:
         deadline = time.monotonic() + timeout
         if self.remote_deadline:
             deadline = min(deadline, self.remote_deadline - 15)
-        names, hits = [], set()
+        names, hits, seen_names = [], set(), set()
+        scroll_started = False
         while True:
             if not self.is_current():
                 raise ScanError('本轮查询已取消。')
@@ -461,13 +478,17 @@ class Scanner:
               for (let i = 0; parent && parent !== n && i < 6; i++, parent = parent.parentElement) {
                 if (parent.textContent.length <= 1000) titles.push(parent.textContent);
               }
-              return {href: n.href,
+              return {href: n.href, rendered: !!([n, ...n.children].some(c => {
+                  const box = c.getBoundingClientRect(); return box.width > 0 && box.height > 0;
+                }) && getComputedStyle(n).visibility !== 'hidden' && !n.closest('[hidden],[aria-hidden="true"]')),
                 labels: [n.querySelector('h1,h2,h3,h4,[role="heading"]')?.textContent || '',
                          n.getAttribute('aria-label') || '', ...titles, (n.textContent || '').slice(0, 1000)]
                   .map(s => s.replace(/\\s+/g, ' ').trim()).filter(Boolean)};
             })""")
             names, hits = [], set()
             for item in links:
+                if not item['rendered']:
+                    continue
                 try:
                     destination = official_url(item['href'])
                 except ScanError:
@@ -480,17 +501,26 @@ class Scanner:
                     label = labels[0][:100]
                     if label not in names:
                         names.append(label)
+                        if len(seen_names) < 128:
+                            seen_names.add(label)
             if len(hits) == 1:
                 return hits.pop()
             if len(hits) > 1 or time.monotonic() >= deadline:
                 break
+            self.mark_operation('向下滚动查找' + name[:100], timeout=timeout)
+            if not scroll_started:
+                await self.scroll_search(page, reset=True)
+                scroll_started = True
+            await self.scroll_search(page)
             await asyncio.sleep(poll_interval)
+        names = list(seen_names)
         words = set(target.split())
         names.sort(key=lambda text: (-len(words.intersection(normalize(text).split())), text.casefold()))
         names = names[:8]
         label = '场馆' if kind == 'venue' else '运动项目'
         text = (f'官网出现多个名为「{name}」的{label}链接，无法唯一选择。' if len(hits) > 1
-                else f'未能找到「{name}」的{label}链接；已等待列表加载。')
+                else f'未能找到「{name}」的{label}链接；已等待列表加载'
+                + ('并向下滚动查找。' if scroll_started else '。'))
         if names and not hits:
             text += ' 页面可见名称：' + '、'.join(names[:3]) + '。'
         text += ' 发送 /diagnose 查看本轮页面证据。'
@@ -546,13 +576,34 @@ class Scanner:
         # Click the actual visible card; responsive pages may contain hidden
         # copies with the same href before the visible one.
         destination = official_url(destination)
-        links = await page.locator('a[href]').evaluate_all(
-            "nodes => nodes.map(n => ({href:n.href, raw:n.getAttribute('href')}))")
+        links = await page.locator('a[href]').evaluate_all("""nodes => nodes.map(n => ({
+            href: n.href, raw: n.getAttribute('href'),
+            rendered: !!([n, ...n.children].some(c => {
+                const box = c.getBoundingClientRect(); return box.width > 0 && box.height > 0;
+            }) && getComputedStyle(n).visibility !== 'hidden' && !n.closest('[hidden],[aria-hidden="true"]'))
+        }))""")
         for link in links:
-            if link['href'] == destination:
+            if link['href'] == destination and link['rendered']:
                 target = page.locator('a[href=' + json.dumps(link['raw']) + ']:visible').first
-                self.mark_operation('点击' + (self.progress.get('target') or '页面按钮'),
-                                    timeout=timeout, clicked=False)
+                name = self.progress.get('target') or '页面按钮'
+                self.mark_operation('滚动到' + name[:100], timeout=timeout,
+                                    target_scrolled=False, clicked=False)
+                if not self.is_current():
+                    raise ScanError('本轮查询已取消。')
+                # Some card links use display:contents, which has no box of its
+                # own. The rendered child belongs to the same verified link.
+                for _ in range(4):
+                    box = await target.bounding_box(timeout=timeout * 1000)
+                    if box and box['width'] > 0 and box['height'] > 0:
+                        break
+                    target = target.locator(':scope > *:visible').first
+                await target.scroll_into_view_if_needed(timeout=timeout * 1000)
+                self.progress['target_scrolled'] = True
+                position = await target.evaluate(TARGET_POSITION)
+                self.progress['target_in_view'] = position['in_view']
+                self.mark_operation('点击' + name[:100], timeout=timeout)
+                if not self.is_current():
+                    raise ScanError('本轮查询已取消。')
                 await target.click(timeout=timeout * 1000, no_wait_after=True)
                 self.mark_operation('等待点击后的页面切换', timeout=timeout, clicked=True)
                 # Confirm the route, then let the next reader wait for the
