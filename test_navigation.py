@@ -63,7 +63,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         try:
             text = await asyncio.wait_for(self.scanner.goto(self.page, ACTIVITIES), timeout=1.5)
             self.assertIn('Tennis', text)
-            self.assertEqual(await self.scanner.find_link(self.page, 'Tennis', timeout=0),
+            self.assertEqual(await self.scanner.find_link(self.page, 'Tennis', timeout=1, poll_interval=0.02),
                              'https://activesg.gov.sg/facility-bookings/activities/tennis')
             self.assertNotEqual(await self.page.evaluate('document.readyState'), 'complete')
         finally:

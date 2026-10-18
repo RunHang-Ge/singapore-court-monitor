@@ -112,6 +112,76 @@ class ScrollingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('https://', format_failure(saved))
         self.assertEqual(json.loads((Path(self.directory) / 'last-query-failure.json').read_text(encoding='utf-8'))['step']['stage'], '查找运动项目')
 
+    async def test_visible_target_still_requires_scrolling_to_the_bottom(self):
+        await self.load('''<h1>Activities</h1>
+          <a href="/facility-bookings/activities/tennis">Tennis</a>
+          <div style="height:6500px">Other sports below</div>''')
+        self.assertLess((await self.page.locator('a').bounding_box())['y'], 900)
+        link = await self.scanner.find_link(self.page, 'Tennis', timeout=2, poll_interval=0.02)
+        self.assertEqual(link, self.destination)
+        self.assertTrue(await self.page.evaluate('scrollY + innerHeight >= document.scrollingElement.scrollHeight - 4'))
+        self.assertGreater(self.scanner.progress['search_scroll_steps'], 5)
+        self.assertTrue(self.scanner.progress['search_bottom_confirmed'])
+
+    async def test_new_content_at_bottom_is_scrolled_until_the_final_bottom(self):
+        await self.load('''<h1>Activities</h1>
+          <a href="/facility-bookings/activities/tennis">Tennis</a>
+          <div style="height:1400px">First batch</div><script>
+          window.batches = 0; window.pending = false;
+          addEventListener('scroll', () => {
+            if (scrollY + innerHeight >= document.scrollingElement.scrollHeight - 4 &&
+                batches < 2 && !pending) {
+              pending = true;
+              setTimeout(() => {
+                const next = document.createElement('div');
+                next.style.height = '1400px'; next.textContent = 'Next sports';
+                document.body.append(next); batches++; pending = false;
+              }, 200);
+            }
+          });</script>''')
+        self.assertEqual(await self.scanner.find_link(self.page, 'Tennis', timeout=3, poll_interval=0.02), self.destination)
+        self.assertEqual(await self.page.evaluate('batches'), 2)
+        self.assertTrue(await self.page.evaluate('scrollY + innerHeight >= document.scrollingElement.scrollHeight - 4'))
+        self.assertTrue(self.scanner.progress['search_bottom_confirmed'])
+
+    async def test_nested_list_reaches_bottom_even_if_target_is_initially_visible(self):
+        await self.load('''<h1>Activities</h1>
+          <main id="list" style="height:320px;width:800px;overflow-y:auto">
+          <a href="/facility-bookings/activities/tennis">Tennis</a>
+          <div style="height:6500px">Other sports below</div></main>''')
+        self.assertEqual(await self.scanner.find_link(self.page, 'Tennis', timeout=4, poll_interval=0.02), self.destination)
+        self.assertTrue(await self.page.locator('#list').evaluate('n => n.scrollTop + n.clientHeight >= n.scrollHeight - 4'))
+        self.assertEqual(await self.page.evaluate('scrollY'), 0)
+        self.assertTrue(self.scanner.progress['search_bottom_confirmed'])
+
+    async def test_never_ending_list_times_out_without_accepting_early_target(self):
+        await self.load('''<h1>Activities</h1>
+          <a href="/facility-bookings/activities/tennis">Tennis</a>
+          <div style="height:1400px"></div><script>
+          addEventListener('scroll', () => {
+            if (scrollY + innerHeight >= document.scrollingElement.scrollHeight - 4) {
+              const next = document.createElement('div'); next.style.height = '1400px';
+              document.body.append(next);
+            }
+          });</script>''')
+        with self.assertRaisesRegex(ScanError, '尚未确认列表到底') as caught:
+            await self.scanner.find_link(self.page, 'Tennis', timeout=0.45, poll_interval=0.02)
+        await self.scanner.save_failure(caught.exception)
+        saved = self.scanner.last_failure()
+        self.assertFalse(saved['step']['search_bottom_confirmed'])
+        self.assertIn('列表是否已滚动到底：尚未确认', format_failure(saved))
+
+    async def test_pause_during_scrolling_stops_before_reaching_bottom(self):
+        await self.load('''<h1>Activities</h1>
+          <a href="/facility-bookings/activities/tennis">Tennis</a>
+          <div style="height:6500px"></div>''')
+        self.scanner.is_current = lambda: self.scanner.progress.get('search_scroll_steps', 0) < 2
+        with self.assertRaisesRegex(ScanError, '已取消'):
+            await self.scanner.find_link(self.page, 'Tennis', timeout=2, poll_interval=0.02)
+        self.assertEqual(self.scanner.progress['search_scroll_steps'], 2)
+        self.assertFalse(await self.page.evaluate('scrollY + innerHeight >= document.scrollingElement.scrollHeight - 4'))
+
+
     async def test_cancelled_query_does_not_scroll_or_click(self):
         await self.load('<h1>Activities</h1><div style="height:2000px"></div>')
         self.scanner.is_current = lambda: False

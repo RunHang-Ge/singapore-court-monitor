@@ -22,6 +22,7 @@ SCROLL_LIST = r"""reset => {
     if (delta > 1) { moved++; distance += delta; }
   }
   return {moved, distance: Math.round(distance), containers: panels.length,
+    geometry: nodes.map(n => [Math.round(n.scrollTop), n.scrollHeight, n.clientHeight, n.clientWidth]),
     at_bottom: nodes.every(n => n.scrollTop + n.clientHeight >= n.scrollHeight - 4)};
 }"""
 

@@ -142,7 +142,7 @@ class VenueLoadingTests(unittest.IsolatedAsyncioTestCase):
                         await route.fulfill(content_type='text/html', body='<h1>Tennis</h1><a href="/facility-bookings/venues/kallang">' + card + '</a>')
                     await page.route('https://activesg.gov.sg/**', fixture)
                     await page.goto(ACTIVITIES)
-                    self.assertEqual(await scanner.find_link(page, 'Kallang Tennis Centre', kind='venue', timeout=0),
+                    self.assertEqual(await scanner.find_link(page, 'Kallang Tennis Centre', kind='venue', timeout=1, poll_interval=0.02),
                                      'https://activesg.gov.sg/facility-bookings/venues/kallang')
                     await page.unroute('https://activesg.gov.sg/**', fixture)
             finally:

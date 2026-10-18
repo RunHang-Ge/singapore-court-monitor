@@ -460,6 +460,15 @@ class Scanner:
             deadline = min(deadline, self.remote_deadline - 15)
         names, hits, seen_names = [], set(), set()
         scroll_started = False
+        bottom_geometry = None
+        bottom_since = None
+        bottom_checks = 0
+        # Reaching the current end can start another lazy-loaded batch. Require
+        # repeated failed downward scrolls and stable list dimensions before
+        # treating that position as the real bottom.
+        settle_seconds = min(1.0, max(0.05, timeout / 3))
+        self.mark_operation('向下滚动查找' + name[:100], timeout=timeout,
+                            search_bottom_confirmed=False)
         while True:
             if not self.is_current():
                 raise ScanError('本轮查询已取消。')
@@ -485,7 +494,7 @@ class Scanner:
                          n.getAttribute('aria-label') || '', ...titles, (n.textContent || '').slice(0, 1000)]
                   .map(s => s.replace(/\\s+/g, ' ').trim()).filter(Boolean)};
             })""")
-            names, hits = [], set()
+            names = []
             for item in links:
                 if not item['rendered']:
                     continue
@@ -503,24 +512,42 @@ class Scanner:
                         names.append(label)
                         if len(seen_names) < 128:
                             seen_names.add(label)
-            if len(hits) == 1:
-                return hits.pop()
-            if len(hits) > 1 or time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
                 break
-            self.mark_operation('向下滚动查找' + name[:100], timeout=timeout)
             if not scroll_started:
                 await self.scroll_search(page, reset=True)
                 scroll_started = True
-            await self.scroll_search(page)
-            await asyncio.sleep(poll_interval)
+            state = await self.scroll_search(page)
+            checked_at = time.monotonic()
+            if state['at_bottom'] and not state['moved']:
+                if bottom_geometry != state['geometry']:
+                    bottom_geometry, bottom_since, bottom_checks = state['geometry'], checked_at, 1
+                else:
+                    bottom_checks += 1
+                confirmed = bottom_checks >= 2 and checked_at - bottom_since >= settle_seconds
+            else:
+                bottom_geometry, bottom_since, bottom_checks = None, None, 0
+                confirmed = False
+            self.progress['search_bottom_confirmed'] = confirmed
+            if confirmed and checked_at <= deadline and hits:
+                if len(hits) == 1:
+                    return hits.pop()
+                break
+            # Move through long lists promptly; pause longer at the end so new
+            # content can extend the list. No fixed number of scroll attempts.
+            pause = min(poll_interval, 0.1) if state['moved'] else poll_interval
+            await asyncio.sleep(min(pause, max(0, deadline - time.monotonic())))
         names = list(seen_names)
         words = set(target.split())
         names.sort(key=lambda text: (-len(words.intersection(normalize(text).split())), text.casefold()))
         names = names[:8]
         label = '场馆' if kind == 'venue' else '运动项目'
-        text = (f'官网出现多个名为「{name}」的{label}链接，无法唯一选择。' if len(hits) > 1
-                else f'未能找到「{name}」的{label}链接；已等待列表加载'
-                + ('并向下滚动查找。' if scroll_started else '。'))
+        if len(hits) > 1:
+            text = f'官网出现多个名为「{name}」的{label}链接，无法唯一选择。'
+        elif not self.progress.get('search_bottom_confirmed'):
+            text = f'滚动查找「{name}」时尚未确认列表到底，已达到本轮等待上限；未采用本轮结果。'
+        else:
+            text = f'已滚动至列表底部并等待加载，未能找到「{name}」的{label}链接。'
         if names and not hits:
             text += ' 页面可见名称：' + '、'.join(names[:3]) + '。'
         text += ' 发送 /diagnose 查看本轮页面证据。'

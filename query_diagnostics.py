@@ -100,7 +100,8 @@ def format_failure(value, include_url=False):
         if 'search_scroll_steps' in step:
             lines.append('滚动查找：' + str(step['search_scroll_steps']) + ' 次；累计 ' +
                          str(step.get('search_scroll_distance', 0)) + ' 像素')
-            lines.append('列表是否已滚动到底：' + ('是' if step.get('search_at_bottom') else '否'))
+            confirmed = step.get('search_bottom_confirmed', step.get('search_at_bottom', False))
+            lines.append('列表是否已滚动到底：' + ('是（已等待底部稳定）' if confirmed else '尚未确认'))
         if 'target_scrolled' in step:
             lines.append('滚动到目标按钮：' + ('已完成' if step['target_scrolled'] else '尚未完成'))
         if 'target_in_view' in step:
