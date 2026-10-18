@@ -17,6 +17,7 @@ from memory_usage import log_memory
 from models import now_sg, slot_from_control, SG
 from slot_reader import READ_SLOTS
 from page_scrolling import SCROLL_LIST, TARGET_POSITION
+from activity_controls import ActivityButton, LIST_SELECTOR, READ_TARGETS, matches
 
 BASE = 'https://activesg.gov.sg'
 ACTIVITIES = BASE + '/facility-bookings/activities'
@@ -459,6 +460,7 @@ class Scanner:
         if self.remote_deadline:
             deadline = min(deadline, self.remote_deadline - 15)
         names, hits, seen_names = [], set(), set()
+        button_hits = []
         scroll_started = False
         bottom_geometry = None
         bottom_since = None
@@ -473,39 +475,28 @@ class Scanner:
             if not self.is_current():
                 raise ScanError('本轮查询已取消。')
             await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
-            links = await page.locator('a[href]').evaluate_all("""nodes => nodes.map(n => {
-              const walker = document.createTreeWalker(n, NodeFilter.SHOW_TEXT);
-              let first;
-              while ((first = walker.nextNode())) {
-                if (first.textContent.trim() && !first.parentElement.closest(
-                    'script,style,svg,[hidden],[aria-hidden="true"]')) break;
-              }
-              // Follow only the first content node's ancestors. Taking every
-              // descendant's text could mistake a nearby-venue note for a title.
-              const titles = first ? [first.textContent] : [];
-              let parent = first?.parentElement;
-              for (let i = 0; parent && parent !== n && i < 6; i++, parent = parent.parentElement) {
-                if (parent.textContent.length <= 1000) titles.push(parent.textContent);
-              }
-              return {href: n.href, rendered: !!([n, ...n.children].some(c => {
-                  const box = c.getBoundingClientRect(); return box.width > 0 && box.height > 0;
-                }) && getComputedStyle(n).visibility !== 'hidden' && !n.closest('[hidden],[aria-hidden="true"]')),
-                labels: [n.querySelector('h1,h2,h3,h4,[role="heading"]')?.textContent || '',
-                         n.getAttribute('aria-label') || '', ...titles, (n.textContent || '').slice(0, 1000)]
-                  .map(s => s.replace(/\\s+/g, ' ').trim()).filter(Boolean)};
-            })""")
-            names = []
+            selector = LIST_SELECTOR if kind == 'activity' else 'a[href]'
+            links = await page.locator(selector).evaluate_all(READ_TARGETS)
+            names, button_hits = [], []
             for item in links:
                 if not item['rendered']:
                     continue
-                try:
-                    destination = official_url(item['href'])
-                except ScanError:
-                    continue
+                destination = None
+                if item['control']:
+                    if kind != 'activity':
+                        continue
+                else:
+                    try:
+                        destination = official_url(item['href'])
+                    except ScanError:
+                        continue
                 labels = [card_name(label) for label in item['labels']]
                 labels = [label for label in labels if label]
                 if any(normalize(label) == target for label in labels):
-                    hits.add(destination)
+                    if item['control']:
+                        button_hits.append(ActivityButton.from_item(item, name))
+                    else:
+                        hits.add(destination)
                 if labels:
                     label = labels[0][:100]
                     if label not in names:
@@ -529,9 +520,11 @@ class Scanner:
                 bottom_geometry, bottom_since, bottom_checks = None, None, 0
                 confirmed = False
             self.progress['search_bottom_confirmed'] = confirmed
-            if confirmed and checked_at <= deadline and hits:
+            if confirmed and checked_at <= deadline and (hits or button_hits):
                 if len(hits) == 1:
                     return hits.pop()
+                if not hits and len(button_hits) == 1:
+                    return button_hits[0]
                 break
             # Move through long lists promptly; pause longer at the end so new
             # content can extend the list. No fixed number of scroll attempts.
@@ -542,12 +535,13 @@ class Scanner:
         names.sort(key=lambda text: (-len(words.intersection(normalize(text).split())), text.casefold()))
         names = names[:8]
         label = '场馆' if kind == 'venue' else '运动项目'
-        if len(hits) > 1:
-            text = f'官网出现多个名为「{name}」的{label}链接，无法唯一选择。'
+        if len(hits) > 1 or not hits and len(button_hits) > 1:
+            text = f'官网出现多个名为「{name}」的{label}入口，无法唯一选择。'
         elif not self.progress.get('search_bottom_confirmed'):
             text = f'滚动查找「{name}」时尚未确认列表到底，已达到本轮等待上限；未采用本轮结果。'
         else:
-            text = f'已滚动至列表底部并等待加载，未能找到「{name}」的{label}链接。'
+            entry = '链接或展开按钮' if kind == 'activity' else '链接'
+            text = f'已滚动至列表底部并等待加载，未能找到「{name}」的{label}入口（{entry}）。'
         if names and not hits:
             text += ' 页面可见名称：' + '、'.join(names[:3]) + '。'
         text += ' 发送 /diagnose 查看本轮页面证据。'
@@ -556,7 +550,7 @@ class Scanner:
         except Exception:
             diagnostic = {'category': 'unavailable', 'label': '未取得页面证据', 'evidence': []}
         diagnostic['lookup'] = {'kind': kind, 'requested': name[:200], 'candidate_names': names,
-                                'exact_destinations': len(hits)}
+                                'exact_destinations': len(hits), 'exact_buttons': len(button_hits)}
         failure = ScanError(text)
         failure.diagnostic = diagnostic
         raise failure
@@ -599,9 +593,140 @@ class Scanner:
                     self.handoff = None
                     self.progress = {}
 
+    async def click_target(self, page, target, name, timeout):
+        self.mark_operation('滚动到' + name[:100], timeout=timeout,
+                            target_scrolled=False, clicked=False)
+        if not self.is_current():
+            raise ScanError('本轮查询已取消。')
+        # A display:contents link has no box; its rendered card still belongs
+        # to the same validated link. Never use a forced or coordinate click.
+        for _ in range(4):
+            box = await target.bounding_box(timeout=timeout * 1000)
+            if box and box['width'] > 0 and box['height'] > 0:
+                break
+            target = target.locator(':scope > *:visible').first
+        await target.scroll_into_view_if_needed(timeout=timeout * 1000)
+        self.progress['target_scrolled'] = True
+        self.progress['target_in_view'] = (await target.evaluate(TARGET_POSITION))['in_view']
+        self.mark_operation('点击' + name[:100], timeout=timeout)
+        if not self.is_current():
+            raise ScanError('本轮查询已取消。')
+        await target.click(timeout=timeout * 1000, no_wait_after=True)
+        self.progress['clicked'] = True
+
+    async def activity_panel(self, page, button, target):
+        # Clicking can already have replaced the document. Read a snapshot
+        # without auto-waiting for an old button to reappear on the new page.
+        control = await target.evaluate_all("nodes => nodes.length === 1 ? {controls:nodes[0].getAttribute('aria-controls')} : null")
+        if control is None:
+            return None
+        controls = control['controls'] or button.controls_id
+        if controls:
+            panel = page.locator('[id=' + json.dumps(controls, ensure_ascii=False) + ']:visible')
+            return panel if await panel.count() == 1 else None
+        if button.summary:
+            details = target.locator('..')
+            if await details.evaluate_all("nodes => nodes.length === 1 && nodes[0].tagName === 'DETAILS' && nodes[0].open"):
+                return details
+        # Support local accordion wrappers without aria-controls. Never widen
+        # the search to the whole document or to a wrapper of several groups.
+        panel = target.locator('..')
+        for _ in range(4):
+            state = await panel.evaluate_all('''nodes => nodes.length === 1 ? ((n) => ({
+              boundary: ['BODY','HTML','MAIN'].includes(n.tagName),
+              groups: n.querySelectorAll('[aria-expanded],summary').length,
+              options: n.querySelectorAll('a[href],button,[role="button"]').length
+            }))(nodes[0]) : null''')
+            if state is None:
+                return None
+            if state['boundary'] or state['groups'] > 1:
+                break
+            if state['options'] > 1:
+                return panel
+            panel = panel.locator('..')
+        return None
+
+    async def click_activity_button(self, page, button, timeout=15, depth=0, scope=None):
+        from playwright.async_api import Error as BrowserError
+        if depth > 2:
+            raise ScanError('运动项目出现多层未识别的分组，本轮未采用。')
+        official_url(page.url)
+        if not self.is_current():
+            raise ScanError('本轮查询已取消。')
+        deadline = time.monotonic() + timeout
+        if self.remote_deadline:
+            deadline = min(deadline, self.remote_deadline - 15)
+        target = button.locator(scope if scope is not None else page)
+        if await target.count() != 1:
+            raise ScanError('运动项目按钮已变化或不唯一，本轮未采用。')
+        before = urlparse(page.url)
+        self.progress.update(activity_group=button.name, activity_group_expanded=False)
+        expanded = await target.evaluate('''n => n.tagName === 'SUMMARY'
+            ? n.parentElement.open : n.getAttribute('aria-expanded') === 'true' ''')
+        if not expanded:
+            await self.click_target(page, target, button.name, max(0.05, deadline - time.monotonic()))
+        self.mark_operation('等待' + button.name[:100] + '展开或进入场馆列表', timeout=timeout)
+        options, problem = [], None
+        while time.monotonic() < deadline:
+            if not self.is_current():
+                raise ScanError('本轮查询已取消。')
+            current = urlparse(official_url(page.url))
+            if (current.path, current.query) != (before.path, before.query):
+                return await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
+            await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
+            try:
+                panel = await self.activity_panel(page, button, target)
+                items = await panel.locator(LIST_SELECTOR).evaluate_all(READ_TARGETS) if panel is not None else None
+            except BrowserError as error:
+                if 'Execution context was destroyed' not in str(error):
+                    raise
+                await asyncio.sleep(0.05)
+                continue
+            if items is not None:
+                self.progress['activity_group_expanded'] = True
+                items = [item for item in items if item['rendered']]
+                options = list(dict.fromkeys(item['labels'][0][:100] for item in items if item['labels']))[:12]
+                self.progress['activity_options'] = options
+                links, buttons = set(), []
+                for item in items:
+                    if not matches(item, button.name):
+                        continue
+                    if item['control']:
+                        candidate = ActivityButton.from_item(item, button.name)
+                        if candidate != button:
+                            buttons.append(candidate)
+                    else:
+                        try:
+                            links.add(official_url(item['href']))
+                        except ScanError:
+                            pass
+                if len(links) > 1 or not links and len(buttons) > 1:
+                    problem = '展开后有多个同名选项，无法唯一选择。'
+                    break
+                remaining = max(0.05, deadline - time.monotonic())
+                if len(links) == 1:
+                    self.progress['activity_selected'] = button.name
+                    return await self.click_link(page, links.pop(), timeout=remaining)
+                if len(buttons) == 1:
+                    self.progress['activity_selected'] = button.name
+                    return await self.click_activity_button(page, buttons[0], timeout=remaining, depth=depth + 1, scope=panel)
+            await asyncio.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        if problem is None:
+            problem = ('已展开，但没有找到名称完全一致的子选项。' if self.progress.get('activity_group_expanded')
+                       else '已找到展开按钮，但尚未确认展开或进入场馆列表。')
+        failure = ScanError('「' + button.name + '」' + problem + ' 本轮未采用；发送 /diagnose 查看证据。')
+        diagnostic, _ = await self.inspect_page(page)
+        diagnostic['lookup'] = {'kind': 'activity', 'requested': button.name,
+                                'candidate_names': options, 'group': button.name}
+        failure.diagnostic = diagnostic
+        raise failure
+
+
     async def click_link(self, page, destination, timeout=15):
         # Click the actual visible card; responsive pages may contain hidden
         # copies with the same href before the visible one.
+        if isinstance(destination, ActivityButton):
+            return await self.click_activity_button(page, destination, timeout=timeout)
         destination = official_url(destination)
         links = await page.locator('a[href]').evaluate_all("""nodes => nodes.map(n => ({
             href: n.href, raw: n.getAttribute('href'),
@@ -613,25 +738,7 @@ class Scanner:
             if link['href'] == destination and link['rendered']:
                 target = page.locator('a[href=' + json.dumps(link['raw']) + ']:visible').first
                 name = self.progress.get('target') or '页面按钮'
-                self.mark_operation('滚动到' + name[:100], timeout=timeout,
-                                    target_scrolled=False, clicked=False)
-                if not self.is_current():
-                    raise ScanError('本轮查询已取消。')
-                # Some card links use display:contents, which has no box of its
-                # own. The rendered child belongs to the same verified link.
-                for _ in range(4):
-                    box = await target.bounding_box(timeout=timeout * 1000)
-                    if box and box['width'] > 0 and box['height'] > 0:
-                        break
-                    target = target.locator(':scope > *:visible').first
-                await target.scroll_into_view_if_needed(timeout=timeout * 1000)
-                self.progress['target_scrolled'] = True
-                position = await target.evaluate(TARGET_POSITION)
-                self.progress['target_in_view'] = position['in_view']
-                self.mark_operation('点击' + name[:100], timeout=timeout)
-                if not self.is_current():
-                    raise ScanError('本轮查询已取消。')
-                await target.click(timeout=timeout * 1000, no_wait_after=True)
+                await self.click_target(page, target, name, timeout)
                 self.mark_operation('等待点击后的页面切换', timeout=timeout, clicked=True)
                 # Confirm the route, then let the next reader wait for the
                 # required UI. Waiting for load would also wait for every image.

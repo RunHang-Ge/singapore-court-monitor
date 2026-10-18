@@ -102,6 +102,13 @@ def format_failure(value, include_url=False):
                          str(step.get('search_scroll_distance', 0)) + ' 像素')
             confirmed = step.get('search_bottom_confirmed', step.get('search_at_bottom', False))
             lines.append('列表是否已滚动到底：' + ('是（已等待底部稳定）' if confirmed else '尚未确认'))
+        if step.get('activity_group'):
+            lines.append('运动项目分组：' + str(step['activity_group'])[:100])
+            lines.append('分组展开：' + ('已完成' if step.get('activity_group_expanded') else '尚未确认'))
+        if step.get('activity_options'):
+            lines.append('分组内选项：' + '、'.join(str(name)[:100] for name in step['activity_options'][:12]))
+        if step.get('activity_selected'):
+            lines.append('选择的子选项：' + str(step['activity_selected'])[:100])
         if 'target_scrolled' in step:
             lines.append('滚动到目标按钮：' + ('已完成' if step['target_scrolled'] else '尚未完成'))
         if 'target_in_view' in step:
