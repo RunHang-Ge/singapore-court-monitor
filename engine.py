@@ -9,7 +9,7 @@ import secrets
 
 from remote_browser import RemoteBrowserError
 from query_diagnostics import format_failure
-from models import Config, now_sg, parse_dates, parse_set, parse_window, summaries
+from models import Config, now_sg, parse_dates, parse_set, parse_window, summaries, query_summaries, unavailable_dates
 from telegram_api import TelegramError
 
 HELP = '''可用指令：
@@ -25,7 +25,7 @@ HELP = '''可用指令：
 /check 立即查询一次
 /pause 暂停；/resume 恢复
 
-任意完整一小时可选即可。每轮完成后按日期逐行汇总，不附链接；自动提醒只包含相比上次成功查询新增或重新出现的时段。'''
+时间点为一小时场次的开始时间，例如 19:00-21:00 匹配 19:00、20:00。每轮完成后每天一行，不附链接；页面未提供的日期会注明不可查询。/check 返回本轮完整结果；自动提醒只包含新增或重新出现的时间点，及变化的不可查询日期。'''
 
 
 class Engine:
@@ -164,10 +164,8 @@ class Engine:
                         '\n发送 /diagnose 查看本轮失败证据，/browser 或 /check 重试。']
             return ['当前条件尚未完成查询。' + ('正在查询，请等待本轮完成。' if self.busy else '发送 /check 开始查询。')]
         last = rt['last']
-        messages = summaries(last['matches']) or ['最近一轮未发现符合条件的可选时段。']
-        messages[0] = '查询时间：' + last['checked_at'][:19].replace('T', ' ') + '（新加坡时间）\n' + messages[0]
-        unavailable = [r['date'] for r in last['results'] if r['status'] == 'not_selectable']
-        suffix = ('\n官网暂不可选日期：' + '、'.join(unavailable)) if unavailable else ''
+        messages = query_summaries(last, '查询时间：' + last['checked_at'][:19].replace('T', ' ') + '（新加坡时间）')
+        suffix = ''
         if rt['error']:
             suffix += '\n最近一次查询失败，以上为上次成功结果。'
         if suffix:
@@ -281,7 +279,7 @@ class Engine:
                     else:
                         self.trigger.set()
                         reply = ('已安排人工入口查询；需要验证时会发送入口，未生成入口也会回复本轮原因。'
-                                 if command == '/browser' else '已安排一次查询；本轮会回复成功或失败，新增时段会自动提醒。')
+                                 if command == '/browser' else '已安排一次查询；完成后按日期汇总时间点，并列出不可查询的日期。')
             elif '/' in text and not text.startswith('/'):
                 reply = self.change_config(parse_set(text))
             else:
@@ -385,16 +383,29 @@ class Engine:
             latest = self.runtime()
             new = [s for s in result['matches'] if s['key'] not in latest['seen']]
             manual = self.manual_request(revision)
+            unavailable = unavailable_dates(result)
+            previous_unavailable = unavailable_dates(latest['last'] or {})
+            changed_dates = {day: reason for day, reason in unavailable.items()
+                             if previous_unavailable.get(day) != reason}
+            # An unqueryable date is unknown, rather than proof that a previously
+            # reported time disappeared. Keep that date's comparison baseline.
+            seen = sorted({s['key'] for s in result['matches']} |
+                          {key for key in latest['seen'] if key.split('|')[0] in unavailable})
             with self.store.transaction():
-                if new:
-                    self.store.queue(summaries(new), revision)
                 if manual:
-                    self.store.queue([f"本次 {manual['command']} 查询已完成；符合条件 {len(result['matches'])} 个时段，"
-                                      f"新增或重新出现 {len(new)} 个。完整结果发送 /results 查看。"], revision, 'manual')
+                    self.store.queue(query_summaries(result, f"本次 {manual['command']} 查询已完成（新加坡时间）。"),
+                                     revision, 'manual')
                     self.store.set('manual_query', None)
-                elif latest['error_notified']:
-                    self.store.queue(['ActiveSG 查询已恢复。'], revision, 'status')
-                latest.update(last=result, seen=[s['key'] for s in result['matches']], error=None, error_notified=False)
+                else:
+                    messages = summaries(new, changed_dates)
+                    if latest['error_notified']:
+                        if messages:
+                            messages[0] = 'ActiveSG 查询已恢复。\n' + messages[0]
+                        else:
+                            messages = ['ActiveSG 查询已恢复。']
+                    if messages:
+                        self.store.queue(messages, revision, 'slots' if new else 'status')
+                latest.update(last=result, seen=seen, error=None, error_notified=False)
                 self.store.set('runtime', latest)
         except Exception as error:
             if self.current(revision):

@@ -85,7 +85,7 @@ class ModelTests(unittest.TestCase):
         a, b = slot(), slot(13)
         messages = summaries([b, a, a, {**a, 'date': '2099-12-31', 'key': 'other'}])
         self.assertEqual(len(messages), 1)
-        self.assertEqual(messages[0].split('；\n')[0], a['date'] + ' 12:00–13:00、13:00–14:00')
+        self.assertEqual(messages[0].split('\n')[0], a['date'] + ' 12:00、13:00')
         self.assertNotIn('http', messages[0])
 
     def test_long_summaries_fit_telegram(self):
@@ -94,7 +94,7 @@ class ModelTests(unittest.TestCase):
             for hour in range(23):
                 slots.append({'date': f'2099-01-{day:02}', 'start': f'{hour:02}:00', 'end': f'{hour+1:02}:00'})
         self.assertTrue(all(len(m) < 4096 for m in summaries(slots)))
-        self.assertEqual(sum(len(m.split('；\n')) for m in summaries(slots)), 31)
+        self.assertEqual(sum(len(m.split('\n')) for m in summaries(slots)), 31)
 
     def test_requested_date_is_verified(self):
         c = config()
@@ -280,7 +280,7 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BrowserFixtureTests(unittest.IsolatedAsyncioTestCase):
-    async def test_actual_dom_instant_only_and_disabled_controls(self):
+    async def test_displayed_times_disabled_controls_and_deduplication(self):
         from playwright.async_api import async_playwright
         from urllib.parse import urlparse
         c = config()
@@ -308,7 +308,7 @@ class BrowserFixtureTests(unittest.IsolatedAsyncioTestCase):
             scanner = Scanner('.')
             scanner.page = page
             value = await scanner.scan(c)
-            self.assertEqual(value['matches'], [slot()])
+            self.assertEqual(value['matches'], [slot(), {**slot(13), 'booking_type': 'ballot'}])
             await page.set_content('<title>Just a moment...</title><p>Performing security verification</p>')
             with self.assertRaises(VerificationRequired):
                 await scanner.guard(page)

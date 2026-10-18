@@ -147,7 +147,11 @@ def format_failure(value, include_url=False):
             lines.append('目标文字所在元素：' + ' → '.join(nodes))
     slots = value.get('slots')
     if isinstance(slots, dict):
-        lines.append('读取阶段：时段分组；日期：' + str(slots.get('date', '未知日期'))[:20])
+        lines.append('读取阶段：日期与可选时间；日期：' + str(slots.get('date', '未知日期'))[:20])
+        if 'date_confirmed' in slots:
+            lines.append('选中日期是否一致：' + ('是' if slots['date_confirmed'] else '尚未确认'))
+        if slots.get('displayed'):
+            lines.append('公共区域可选时间控件：' + str(slots['displayed']))
         labels = slots.get('labels', [])
         headings = slots.get('headings', [])
         lines.append('读到的分组文字：' + ('、'.join(str(n)[:80] for n in labels[:12]) if labels else '未识别到即时预约或抽签标题'))

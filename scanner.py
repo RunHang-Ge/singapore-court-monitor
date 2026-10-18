@@ -16,6 +16,7 @@ from remote_browser import RemoteProfile, RemoteBrowserError, provider, live_url
 from memory_usage import log_memory
 from models import now_sg, slot_from_control, SG
 from slot_reader import READ_SLOTS
+from date_controls import READ_DATES
 from page_scrolling import SCROLL_LIST, TARGET_POSITION
 from page_snapshot import READ_PAGE
 from activity_controls import ActivityButton, LIST_SELECTOR, READ_TARGETS, TARGET_EVIDENCE, matches
@@ -68,6 +69,7 @@ class Scanner:
         self.playwright = self.browser = self.context = self.page = None
         self.busy = False
         self.progress = {}
+        self.slot_page_text = ''
         self.last_manual_use = 0.0
         self.manual_idle_seconds = 120
         self.document_response = {}
@@ -234,12 +236,21 @@ class Scanner:
         # Title, text and security markers belong to the same document and take
         # one CDP round trip, rather than three sequential remote reads.
         snapshot = await page.evaluate(READ_PAGE)
+        return self.classify_snapshot(snapshot)
+
+    def classify_snapshot(self, snapshot):
         document = self.document_response if self.document_response.get('url') == safe_url(snapshot['url']) else {}
         return classify(snapshot['url'], snapshot['title'], snapshot['text'],
                         document, snapshot['markers']), snapshot['text']
 
     async def guard(self, page):
         diagnostic, text = await self.inspect_page(page)
+        return self.guard_evidence(diagnostic, text)
+
+    def guard_snapshot(self, snapshot):
+        return self.guard_evidence(*self.classify_snapshot(snapshot))
+
+    def guard_evidence(self, diagnostic, text):
         category = diagnostic['category']
         if category in ('cloudflare_challenge', 'cloudflare_likely', 'cloudflare_widget', 'unknown_security'):
             raise SecurityCheckPending(diagnostic['label'] + '尚未完成。', diagnostic)
@@ -602,6 +613,7 @@ class Scanner:
                     self.remote_deadline = 0.0
                     self.handoff = None
                     self.progress = {}
+                    self.slot_page_text = ''
 
     async def click_target(self, page, target, name, timeout):
         self.mark_operation('滚动到' + name[:100], timeout=timeout,
@@ -769,28 +781,47 @@ class Scanner:
                 return await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
         raise ScanError('场馆或运动项目按钮已变化，本轮未采用。')
 
-    async def select_day(self, page, day, timeout=8, poll_interval=0.25):
+    async def date_inventory(self, page, timeout=8, poll_interval=0.25):
+        """Read all rendered dates once, including horizontally off-screen cards."""
+        self.mark_operation('读取官网提供的日期', timeout=timeout)
+        deadline = time.monotonic() + timeout
+        if self.remote_deadline:
+            deadline = min(deadline, self.remote_deadline - 15)
+        previous, stable_since = None, time.monotonic()
+        while True:
+            if not self.is_current():
+                raise ScanError('本轮查询已取消。')
+            snapshot = await page.evaluate(READ_DATES)
+            self.slot_page_text = self.guard_snapshot(snapshot['page'])
+            dates = [button for button in snapshot['dates'] if button['visible']]
+            identity = [(b['label'], b['disabled']) for b in dates]
+            if identity != previous or snapshot['loading']:
+                previous, stable_since = identity, time.monotonic()
+            if dates and not snapshot['loading'] and time.monotonic() - stable_since >= 0.35:
+                return snapshot['dates']
+            if time.monotonic() >= deadline:
+                raise ScanError('官网日期列表尚未完成加载，不能判断哪些日期可查询。')
+            await asyncio.sleep(poll_interval)
+
+    async def select_day(self, page, day, timeout=8, poll_interval=0.25, buttons=None):
         expected = date.fromisoformat(day).strftime('%a, %d %b').replace(', 0', ', ')
         deadline = time.monotonic() + timeout
         if self.remote_deadline:
             deadline = min(deadline, self.remote_deadline - 15)
         self.mark_operation('查找日期按钮', timeout=timeout)
         locator = page.locator('[aria-label^="View timeslots for"]')
-        buttons = []
         while True:
             if not self.is_current():
                 raise ScanError('本轮查询已取消。')
-            await self.guard(page)
-            buttons = await locator.evaluate_all("""nodes => nodes.map(n => ({
-              label: n.getAttribute('aria-label') || '',
-              selected: n.hasAttribute('data-selected') && n.getAttribute('data-selected') !== 'false'
-                || n.getAttribute('aria-pressed') === 'true' || n.getAttribute('aria-selected') === 'true',
-              disabled: n.matches(':disabled') || n.getAttribute('aria-disabled') === 'true',
-              visible: !!n.getClientRects().length
-            }))""")
+            if buttons is None:
+                snapshot = await page.evaluate(READ_DATES)
+                self.guard_snapshot(snapshot['page'])
+                buttons = snapshot['dates']
             hits = [(index, b) for index, b in enumerate(buttons)
                     if b['visible'] and expected in b['label'].replace(', 0', ', ')]
-            if len(hits) == 1:
+            if len(hits) > 1:
+                raise ScanError('日期按钮不唯一，本轮未采用。')
+            if hits:
                 index, button = hits[0]
                 if button['disabled']:
                     return False
@@ -799,23 +830,19 @@ class Scanner:
                     await locator.nth(index).click(timeout=10000, no_wait_after=True)
                     self.progress['clicked'] = True
                 break
-            if len(hits) > 1:
-                raise ScanError('日期按钮不唯一，本轮未采用。')
             if time.monotonic() >= deadline:
                 if any(b['visible'] for b in buttons):
                     return False
                 raise ScanError('没有读取到日期按钮，本轮未采用。')
+            buttons = None
             await asyncio.sleep(poll_interval)
         self.mark_operation('确认选中的日期', timeout=timeout)
         while True:
-            await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
-            buttons = await locator.evaluate_all("""nodes => nodes.map(n => ({
-              label: n.getAttribute('aria-label') || '',
-              selected: n.hasAttribute('data-selected') && n.getAttribute('data-selected') !== 'false'
-                || n.getAttribute('aria-pressed') === 'true' || n.getAttribute('aria-selected') === 'true'
-            }))""")
+            snapshot = await page.evaluate(READ_DATES)
+            self.guard_snapshot(snapshot['page'])
             try:
-                confirmed = assert_date(day, page.url, buttons)
+                confirmed = assert_date(day, snapshot['page']['url'],
+                                        [b for b in snapshot['dates'] if b['visible']])
             except ScanError:
                 confirmed = False
             if confirmed:
@@ -827,23 +854,36 @@ class Scanner:
             await asyncio.sleep(poll_interval)
 
     async def read_slot_controls(self, page, day, timeout=8, poll_interval=0.25):
-        # Captions and their controls may hydrate after the date has loaded.
+        # The real page uses one common slot grid below the date strip. A slot
+        # need not be nested inside the Instant/Ballot caption of its date.
         deadline = time.monotonic() + timeout
         if self.remote_deadline:
             deadline = min(deadline, self.remote_deadline - 15)
-        self.mark_operation('等待本日时段及分组加载', timeout=timeout)
-        snapshot, active, unknown, stale = {}, [], [], 0
+        self.mark_operation('等待本日可选时间加载', timeout=timeout)
+        snapshot, active, unknown, stale, date_confirmed = {}, [], [], 0, False
         while True:
             if not self.is_current():
                 raise ScanError('本轮查询已取消。')
-            await self.guard(page)
             snapshot = await page.evaluate(READ_SLOTS)
+            self.slot_page_text = self.guard_snapshot(snapshot['page'])
+            dates = [b for b in snapshot['dates'] if b['visible']]
+            try:
+                date_confirmed = bool(dates) and assert_date(day, snapshot['page']['url'], dates)
+            except ScanError:
+                date_confirmed = False
             active = [c for c in snapshot['controls'] if c['visible']]
+            for control in active:
+                if date_confirmed:
+                    control['dateConfirmed'] = day
+                    if not control['bookingType']:
+                        control['bookingType'] = snapshot.get('selected_date_type') or 'displayed'
             unknown = [c for c in active if not c['bookingType'] and not c['disabled']
                        and c.get('ariaDisabled') != 'true']
             stale = 0
             for control in active:
-                if control['bookingType'] != 'instant':
+                if control['disabled'] or control.get('ariaDisabled') == 'true':
+                    continue
+                if control['bookingType'] != 'instant' and not date_confirmed:
                     continue
                 try:
                     stamp = int(control['value'])
@@ -851,30 +891,32 @@ class Scanner:
                     stale += datetime.fromtimestamp(stamp, SG).date().isoformat() != day
                 except (ValueError, TypeError, KeyError, OSError, OverflowError):
                     stale += 1
-            if (active and not unknown and not stale and not snapshot.get('loading')
+            correct_date = not snapshot['dates'] or date_confirmed
+            if (correct_date and active and not unknown and not stale and not snapshot.get('loading')
                     and any(c['bookingType'] for c in active)):
                 return active
+            if correct_date and date_confirmed and not active and snapshot.get('empty') and not snapshot.get('loading'):
+                return []
             if time.monotonic() >= deadline:
                 break
             await asyncio.sleep(poll_interval)
-        try:
-            diagnostic, _ = await asyncio.wait_for(self.inspect_page(page), timeout=3)
-        except Exception:
-            diagnostic = {'category': 'unavailable', 'label': '未取得页面证据', 'evidence': []}
+        diagnostic, _ = self.classify_snapshot(snapshot['page'])
         diagnostic['slots'] = {
             'date': day, 'labels': snapshot.get('labels', []), 'headings': snapshot.get('headings', []),
             'visible': len(active), 'instant': sum(c['bookingType'] == 'instant' for c in active),
             'ballot': sum(c['bookingType'] == 'ballot' for c in active),
             'unknown': sum(not c['bookingType'] for c in active), 'enabled_unknown': len(unknown),
+            'displayed': sum(c['bookingType'] == 'displayed' for c in active),
+            'date_confirmed': date_confirmed,
             'stale_instant': stale, 'loading': bool(snapshot.get('loading')),
         }
-        message = ('没有读取到可见时段控件，不能确认空场情况。' if not active else
-                   '已读取时段控件，但未能确认其即时预约或抽签分组，未采用本轮结果。')
+        message = ('没有读取到可见时间选项或明确的无时段提示，不能确认空场情况。' if not active else
+                   '已读取时间选项，但尚未确认其对应的查询日期，未采用本轮结果。')
         if snapshot.get('loading'):
             message = '页面时段仍在加载，未采用本轮结果。'
         if stale:
-            message = '日期按钮已切换，但时段数据日期仍未一致或时间标识无法读取，未采用本轮结果。'
-        failure = ScanError(message + ' 发送 /diagnose 查看实际分组文字和控件数量。')
+            message = '日期按钮已切换，但时间选项仍属于其他日期或时间标识无法读取，未采用本轮结果。'
+        failure = ScanError(message + ' 发送 /diagnose 查看日期和时间选项证据。')
         failure.diagnostic = diagnostic
         raise failure
 
@@ -890,30 +932,51 @@ class Scanner:
         venue_link = await self.find_link(page, config.venue, kind='venue')
         self.mark_step('进入场馆时段页', target=config.venue)
         await self.click_link(page, venue_link)
+        self.mark_step('读取日期列表', target=config.venue)
+        buttons = await self.date_inventory(page)
+        if config.venue.casefold() not in self.slot_page_text.casefold():
+            raise ScanError('官网场馆与监控条件不一致，本次查询不采用。')
         results, found = [], {}
-        for day in config.days():
+        today = now_sg().date().isoformat()
+        for day in config.requested_days():
             if not self.is_current():
                 raise ScanError('本轮查询已取消。')
             self.mark_step('选择日期', target=config.venue, day=day)
-            if not await self.select_day(page, day):
+            if day < today:
+                results.append({'date': day, 'status': 'past'})
+                continue
+            expected = date.fromisoformat(day).strftime('%a, %d %b').replace(', 0', ', ')
+            hits = [b for b in buttons if b['visible'] and expected in b['label'].replace(', 0', ', ')]
+            if not hits:
+                results.append({'date': day, 'status': 'not_displayed'})
+                continue
+            if len(hits) > 1:
+                raise ScanError('日期按钮不唯一，本轮未采用。')
+            if hits[0]['disabled']:
+                results.append({'date': day, 'status': 'disabled'})
+                continue
+            if not await self.select_day(page, day, buttons=buttons):
                 results.append({'date': day, 'status': 'not_selectable'})
                 continue
-            text = await self.guard(page)
-            for _ in range(8):
-                if 'Each slot is 1 hour long' in text:
-                    break
-                await asyncio.sleep(0.5)
-                text = await self.guard(page)
+            self.mark_step('读取可选时段', target=config.venue, day=day)
+            controls = await self.read_slot_controls(page, day)
+            # Venue and duration are checked from the same atomic page snapshot
+            # as the selected date and controls, rather than another CDP read.
+            text = self.slot_page_text
             if config.venue.casefold() not in text.casefold():
                 raise ScanError('官网场馆与监控条件不一致，本次查询不采用。')
             if 'Each slot is 1 hour long' not in text:
-                raise ScanError('官网一小时预约分组无法确认，本次查询不采用。')
-            self.mark_step('读取可选时段', target=config.venue, day=day)
-            controls = await self.read_slot_controls(page, day)
-            instant = [c for c in controls if c['bookingType'] == 'instant']
-            for control in instant:
-                slot = slot_from_control(config, day, control)
+                raise ScanError('官网一小时预约时长无法确认，本次查询不采用。')
+            for control in controls:
+                if control['bookingType'] != 'instant' and control.get('dateConfirmed') != day:
+                    continue
+                try:
+                    slot = slot_from_control(config, day, control)
+                except ValueError as error:
+                    raise ScanError(str(error)) from None
                 if slot:
+                    if control['bookingType'] == 'ballot':
+                        slot['booking_type'] = 'ballot'
                     found[slot['key']] = slot
             results.append({'date': day, 'status': 'checked'})
         return {'checked_at': now_sg().isoformat(), 'results': results,

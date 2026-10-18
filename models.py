@@ -76,6 +76,12 @@ class Config:
         end = datetime.fromisoformat(f'{self.date_to}T{self.time_to}').replace(tzinfo=SG)
         return (now or now_sg()) >= end
 
+    def requested_days(self):
+        current, last = date.fromisoformat(self.date_from), date.fromisoformat(self.date_to)
+        while current <= last:
+            yield current.isoformat()
+            current += timedelta(days=1)
+
     def days(self, now=None):
         first, last = date.fromisoformat(self.date_from), date.fromisoformat(self.date_to)
         current = max(first, (now or now_sg()).date())
@@ -118,6 +124,8 @@ def slot_from_control(config, requested_date, control, now=None):
         start = datetime.fromtimestamp(stamp, SG)
     except (ValueError, OSError, OverflowError):
         raise ValueError('官网时段时间戳无效。') from None
+    if control.get('timeText') and parse_time(control['timeText']) != start.strftime('%H:%M'):
+        raise ValueError('官网显示时间与时段标识不一致，本次查询不采用。')
     end = start + timedelta(hours=1)
     if start.date().isoformat() != requested_date:
         raise ValueError('官网返回了其他日期的时段，本次查询不采用。')
@@ -129,14 +137,33 @@ def slot_from_control(config, requested_date, control, now=None):
     return {'date': requested_date, 'start': start_text, 'end': end_text, 'key': f'{requested_date}|{start_text}'}
 
 
-def summaries(slots):
+UNAVAILABLE_REASONS = {
+    'not_selectable': '官网暂不可选',
+    'not_displayed': '官网未显示该日期',
+    'disabled': '官网日期按钮不可点击',
+    'past': '日期已过期',
+}
+
+
+def unavailable_dates(result):
+    return {row['date']: UNAVAILABLE_REASONS.get(row['status'], '官网暂不可查询')
+            for row in result.get('results', []) if row['status'] != 'checked'}
+
+
+def _slot_rows(slots):
     by_date = {}
     for item in slots:
-        by_date.setdefault(item['date'], set()).add((item['start'], item['end']))
-    rows = [day + ' ' + '、'.join(f'{a}–{b}' for a, b in sorted(times)) for day, times in sorted(by_date.items())]
-    messages, current = [], ''
+        by_date.setdefault(item['date'], {})[item['start']] = item.get('booking_type', '')
+    return {day: day + ' ' + '、'.join(
+        start + ('（抽签）' if booking_type == 'ballot' else '')
+        for start, booking_type in sorted(times.items()))
+        for day, times in sorted(by_date.items())}
+
+
+def _pack_rows(rows, prefix=''):
+    messages, current = [], prefix.rstrip()
     for row in rows:
-        candidate = current + ('；\n' if current else '') + row
+        candidate = current + ('\n' if current else '') + row
         if len(candidate) > 3900 and current:
             messages.append(current)
             current = row
@@ -145,3 +172,19 @@ def summaries(slots):
     if current:
         messages.append(current)
     return messages
+
+
+def summaries(slots, unavailable=None):
+    rows = _slot_rows(slots)
+    rows.update({day: day + ' 不可查询（' + reason + '）'
+                 for day, reason in (unavailable or {}).items()})
+    return _pack_rows([rows[day] for day in sorted(rows)])
+
+
+def query_summaries(result, prefix=''):
+    rows = {row['date']: row['date'] + ' 无符合条件的时间点'
+            for row in result.get('results', [])}
+    rows.update(_slot_rows(result['matches']))
+    rows.update({day: day + ' 不可查询（' + reason + '）'
+                 for day, reason in unavailable_dates(result).items()})
+    return _pack_rows([rows[day] for day in sorted(rows)] or ['未发现符合条件的可选时间点。'], prefix)

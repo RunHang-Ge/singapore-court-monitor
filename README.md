@@ -6,10 +6,11 @@ Python 3 / FastAPI 的 ActiveSG 空场监控，连接现有 Telegram 机器人 `
 ## 已实现的行为
 
 - 按运动、场馆、日期范围、每天时间段查询 ActiveSG；每 10 分钟开始一轮，上一轮尚未结束时不重叠。
-- 任意完整一小时在即时预约分组可选即可，不执行预约、登录或付款。
-- 完成整轮后汇总通知：每天一行，例如 `2026-10-12 12:00–13:00、13:00–14:00；`，不附链接。
+- 点击官网实际提供的日期，读取下方公共区域可选的一小时开始时间；例如 19:00–21:00 匹配 7:00 pm 和 8:00 pm。识别到抽签日期时会注明“抽签”。不执行预约、登录或付款。
+- 完成整轮后汇总通知：每天一行，例如 `2026-10-19 19:00、20:00`，采用新加坡时间 24 小时制，不附链接。
 - 自动通知只包含相比上次成功查询新增或重新出现的时段。相同和仅减少的时段保持静默。
-- `/results` 返回最近一轮完整结果，不受自动去重影响。
+- 请求范围内官网未显示的日期、不可点击的日期和已过日期分别注明不可查询；不可查询不等同于没有空场。变化的不可查询日期也会通知一次，不每轮重复。
+- `/check` 完成后直接发送本轮完整列表；`/results` 返回最近一轮完整结果，两者不受自动时段去重影响。
 - SQLite 保存条件、去重基线、Webhook 更新和待发送通知。发送失败重试，重启后继续。
 - 查询失败保留上次成功结果，尝试通知一次故障；恢复时通知。Telegram 本身不可连接时不能发送故障通知。
 - 修改条件后丢弃尚未完成的旧查询；暂停后仍可接收指令。
@@ -92,8 +93,8 @@ Hobby 是工作区套餐，Build Pipeline Starter 是构建配置。运行实例
 ```
 
 也可直接发送 `Tennis / Kallang Tennis Centre / 日期范围 / 时间范围`。
-最多 31 天、同一天内至少一小时；所有时间按新加坡解释。不可选日期会标记为未确认，不会使用官网跳转到其他日期的数据。
-`/check` 与 `/browser` 的每次手动请求会回复本轮成功或失败；这类回复不受自动故障去重影响。成功时报告时段总数和新增数，完整列表使用 `/results`。定时扫描仍只播报新增或重新出现的时段，重复故障只提示一次。
+最多 31 天、同一天内至少一小时；所有时间按新加坡解释。日期列表加载后一次读取所有已渲染按钮（包含横向画面外的按钮），对照完整请求日期范围；缺失日期注明“官网未显示该日期”，禁用按钮注明“官网日期按钮不可点击”，过去日期注明“日期已过期”。其余日期逐个原生点击，并核对选中日期及时间选项内的 Unix 时间戳；日期不一致时等待新数据，不沿用上一天仍在显示的时间。
+`/check` 与 `/browser` 的每次手动请求会回复本轮成功或失败；成功后直接发送整轮完整结果，包含全部匹配的时间点、已查询但没有匹配时间的日期，以及不可查询日期，每天一行。同一轮不再另外发送一份新增时间通知。`/results` 返回同样的缓存结果。定时扫描只发送新增或重新出现的时间点及变化的不可查询日期；没有变化则保持静默。不可查询日期保留之前的时间比较基线，避免日期重新可查时错误重复播报。重复故障只提示一次。
 如果汇总超出 Telegram 单条消息长度限制，会按整天分成少量连续消息，不截断或丢弃时段。
 
 ## 人工处理验证：Telegram 远程操作入口
@@ -137,7 +138,7 @@ Browserless 免费方案的单次浏览器连接最长两分钟；入口不能�
 
 ## 确认安全检查的来源
 
-发送 /diagnose 获取最近一次失败时保存的证据。活动或场馆匹配失败时，还会显示查找阶段、目标名称与页面读取到的候选名称，以及目标文字实际所在的有限元素层级；操作失败时会显示实际阶段、等待步骤、耗时、滚动查找次数、目标按钮是否进入画面和点击状态；时段分组读取失败时，也会显示查询日期、分组文字、页面标题文字和控件数量；仅记录官网 facility-bookings 页面中的这些有限信息，不保存完整正文、登录字段或带参数的地址。服务首页「上次查询失败时的证据」可显示页面标题、来源网址（已去除查询参数）、主页面 HTTP 状态、Cloudflare 标记和失败截图；读取证据不会启动浏览器。查询失败后才会保存，因此上线这个版本后需要再查询一次。
+发送 /diagnose 获取最近一次失败时保存的证据。活动或场馆匹配失败时，还会显示查找阶段、目标名称与页面读取到的候选名称，以及目标文字实际所在的有限元素层级；操作失败时会显示实际阶段、等待步骤、耗时、滚动查找次数、目标按钮是否进入画面和点击状态；日期与时间读取失败时，也会显示选中日期是否一致、分组文字、页面标题文字和控件数量；仅记录官网 facility-bookings 页面中的这些有限信息，不保存完整正文、登录字段或带参数的地址。服务首页「上次查询失败时的证据」可显示页面标题、来源网址（已去除查询参数）、主页面 HTTP 状态、Cloudflare 标记和失败截图；读取证据不会启动浏览器。查询失败后才会保存，因此上线这个版本后需要再查询一次。
 
 - cf-mitigated: challenge 明确证明收到 Cloudflare 整页检查；检查页中的 _cf_chl_opt 也是其明确标记。
 - CF-Ray 或 Server: cloudflare 单独出现只能说明经过 Cloudflare，不能证明拦截。Cloudflare 脚本或品牌文字与检查文字同时出现时仍标为「疑似」。
@@ -167,7 +168,7 @@ cd F:\Github\singapore-court-monitor
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
-.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser test_query_feedback test_slot_reader test_navigation test_scrolling test_activity_controls test_chakra_activities test_remote_latency
+.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser test_query_feedback test_slot_reader test_navigation test_scrolling test_activity_controls test_chakra_activities test_remote_latency test_date_time_flow
 .\.venv\Scripts\python.exe browser_diagnostic.py --check
 ```
 
@@ -193,7 +194,9 @@ py -3.13 -m venv .venv
 - `activity_controls.py`：活动链接与展开按钮识别、可见名称精确匹配、按钮定位。
 - `page_snapshot.py`：一次读取页面标题、正文和安全标记，减少远程往返并保持证据来自同一文档。
 - `page_scrolling.py`：活动与场馆列表的分页滚动查找、内部滚动容器处理、目标按钮位置确认。
-- `slot_reader.py`：按分组文字和实际包含关系区分即时预约与抽签，支持普通文字标题、兄弟标题和 aria-labelledby；不把全页所有控件当成即时预约。
+- `date_controls.py`：日期按钮、选中/禁用状态和加载状态的一次读取，支持官网空值 `data-selected` 属性。
+- `slot_reader.py`：同一次浏览器读取中获取选中日期、公共区域时间选项及页面状态。使用真实嵌套 label 和时间戳，不要求时间选项必须位于 Instant/Ballot 标题内；识别到抽签分组时保留标记。
+- `test_date_time_flow.py`：用户提供的真实日期和时间控件 HTML、横向日期栏、缺失/禁用日期、日期切换残留时间、整轮 Telegram 发送和去重。
 - `models.py`：参数解析、新加坡时间、一小时筛选、通知格式。
 - `storage.py`：SQLite 持久化。
 - `telegram_api.py`：Telegram API，错误中不泄露 Token。

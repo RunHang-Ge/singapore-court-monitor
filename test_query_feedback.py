@@ -70,7 +70,8 @@ class QueryFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.notices('slots'), [])
         self.assertEqual(len(self.notices('manual')), 1)
         self.assertIn('已完成', self.notices('manual')[0])
-        self.assertIn('新增或重新出现 0 个', self.notices('manual')[0])
+        self.assertIn(config().date_from + ' 12:00', self.notices('manual')[0])
+        self.assertNotIn('完整结果发送', self.notices('manual')[0])
 
     async def test_request_during_scan_attaches_to_current_query(self):
         self.scanner.error = ScanError('远程连接失败。')

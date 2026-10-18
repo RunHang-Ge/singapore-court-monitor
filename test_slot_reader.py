@@ -69,7 +69,7 @@ class SlotReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved['slots']['instant'], 1)
         self.assertEqual(saved['slots']['enabled_unknown'], 1)
         reply = format_failure(saved)
-        self.assertIn('时段分组', reply)
+        self.assertIn('日期与可选时间', reply)
         self.assertIn(self.c.date_from, reply)
         self.assertNotIn(str(self.stamp), reply)
         self.assertNotIn('https://', reply)
@@ -135,7 +135,9 @@ class SlotReaderTests(unittest.IsolatedAsyncioTestCase):
             await route.fulfill(content_type='text/html', body=html)
         await self.page.route('https://activesg.gov.sg/**', fixture)
         result = await self.scanner.scan(c)
-        self.assertEqual(result['matches'], [slot(), {**slot(), 'date': last, 'key': last + '|12:00'}])
+        self.assertEqual(result['matches'], [slot(), {**slot(13), 'booking_type': 'ballot'},
+            {**slot(), 'date': last, 'key': last + '|12:00'},
+            {**slot(13), 'date': last, 'key': last + '|13:00', 'booking_type': 'ballot'}])
         self.assertTrue(all(row['status'] == 'checked' for row in result['results']))
         self.assertEqual(await self.page.evaluate("sessionStorage.getItem('venueClicked')"), 'yes')
 

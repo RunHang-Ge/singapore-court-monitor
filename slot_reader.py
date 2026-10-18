@@ -1,4 +1,8 @@
-"""Read booking groups without relying on a particular heading element."""
+"""Read the selected date and public time options in one browser snapshot."""
+
+from page_snapshot import READ_PAGE
+from date_controls import DATE_BUTTONS, LOADING
+
 
 READ_SLOTS = r"""() => {
   const visible = n => !!(n.getClientRects().length &&
@@ -57,12 +61,29 @@ READ_SLOTS = r"""() => {
     }
     return '';
   };
+  const dateNodes = [...document.querySelectorAll('[aria-label^="View timeslots for"]')].filter(visible);
+  const selectedDates = dateNodes.filter(n => n.hasAttribute('data-selected') && n.getAttribute('data-selected') !== 'false'
+    || n.getAttribute('aria-pressed') === 'true' || n.getAttribute('aria-selected') === 'true');
+  // Captions label dates on the actual page; their association is useful for
+  // explicitly marking ballot times, but is not a prerequisite to read times.
+  const dateKind = n => {
+    for (let scope = n.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+      const local = markers.filter(marker => scope.contains(marker));
+      if (!local.length) continue;
+      const types = new Set(local.map(marker => kind(marker.textContent)));
+      return types.size === 1 ? [...types][0] : '';
+    }
+    return '';
+  };
+  const selectedDateType = selectedDates.length === 1 ? dateKind(selectedDates[0]) : '';
   const controls = inputs.map(n => {
     const label = n.closest('label') || (n.id ? document.querySelector('label[for="' + CSS.escape(n.id) + '"]') : null);
     const display = label || n;
     return {value: n.value, disabled: n.disabled || n.matches(':disabled'),
       ariaDisabled: n.getAttribute('aria-disabled') || display.getAttribute('aria-disabled'),
-      visible: visible(display), bookingType: group(n)};
+      visible: visible(display), bookingType: group(n) || selectedDateType,
+      timeText: [...display.querySelectorAll('p,span')].map(n => clean(n.textContent))
+        .find(text => /^(?:[01]?\d|2[0-3]):[0-5]\d\s*(?:am|pm)?$/i.test(text)) || ''};
   });
   const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"],legend')]
     .filter(visible).map(n => clean(n.textContent).slice(0, 80));
@@ -70,8 +91,14 @@ READ_SLOTS = r"""() => {
     .filter(n => visible(n) && !n.closest('nav,header,footer,a,button,label') &&
       !n.querySelector('input,script') && n.textContent.length <= 160 && /instant|ballot/i.test(n.textContent))
     .map(n => clean(n.textContent).slice(0, 80));
-  const loading = [...document.querySelectorAll('div,p,span,[role="status"]')]
-    .some(n => visible(n) && !n.querySelector('input,script') && /^loading[\s.…]*$/i.test(clean(n.textContent)));
-  return {controls, loading, labels: [...new Set([...markers.map(n => clean(n.textContent)), ...captions])].slice(0, 12),
+  const empty = [...document.querySelectorAll('p,div,span,[role="status"]')]
+    .some(n => visible(n) && !n.querySelector('input,script') &&
+      /^(?:there are )?no (?:available )?(?:time\s?slots|slots)(?:(?: (?:are )?available| found))?(?: for (?:this|the selected) date)?[.!]?$/i.test(clean(n.textContent)));
+  const page = (__READ_PAGE__)();
+  const dates = (__DATE_BUTTONS__)();
+  const loading = (__LOADING__)();
+  return {controls, loading, empty, page, dates, selected_date_type: selectedDateType, labels: [...new Set([...markers.map(n => clean(n.textContent)), ...captions])].slice(0, 12),
     headings: [...new Set(headings)].slice(0, 12)};
 }"""
+
+READ_SLOTS = READ_SLOTS.replace('__READ_PAGE__', READ_PAGE).replace('__DATE_BUTTONS__', DATE_BUTTONS).replace('__LOADING__', LOADING)
