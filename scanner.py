@@ -17,6 +17,7 @@ from memory_usage import log_memory
 from models import now_sg, slot_from_control, SG
 from slot_reader import READ_SLOTS
 from page_scrolling import SCROLL_LIST, TARGET_POSITION
+from page_snapshot import READ_PAGE
 from activity_controls import ActivityButton, LIST_SELECTOR, READ_TARGETS, TARGET_EVIDENCE, matches
 
 BASE = 'https://activesg.gov.sg'
@@ -230,17 +231,12 @@ class Scanner:
             pass
 
     async def inspect_page(self, page):
-        title = await page.title()
-        text = (await page.locator('body').inner_text())[:20000]
-        markers = await page.evaluate('''() => ({
-          challenge_options: typeof window._cf_chl_opt === 'object',
-          challenge_script: [...document.querySelectorAll('script[src]')].some(
-            n => n.src.includes('/cdn-cgi/challenge-platform/')),
-          widget: [...document.querySelectorAll('iframe[src]')].some(
-            n => {try {return new URL(n.src).hostname === 'challenges.cloudflare.com'} catch {return false}})
-        })''')
-        document = self.document_response if self.document_response.get('url') == safe_url(page.url) else {}
-        return classify(page.url, title, text, document, markers), text
+        # Title, text and security markers belong to the same document and take
+        # one CDP round trip, rather than three sequential remote reads.
+        snapshot = await page.evaluate(READ_PAGE)
+        document = self.document_response if self.document_response.get('url') == safe_url(snapshot['url']) else {}
+        return classify(snapshot['url'], snapshot['title'], snapshot['text'],
+                        document, snapshot['markers']), snapshot['text']
 
     async def guard(self, page):
         diagnostic, text = await self.inspect_page(page)
@@ -440,7 +436,7 @@ class Scanner:
         self.progress['search_at_bottom'] = state['at_bottom']
         return state
 
-    async def find_link(self, page, name, kind='activity', timeout=12, poll_interval=0.5):
+    async def find_link(self, page, name, kind='activity', timeout=None, poll_interval=0.5):
         # Framework navigation can leave a document with headings but no cards
         # yet. Match exact names in card headings/accessible labels, not arbitrary
         # substrings of a card that may also contain prices and court counts.
@@ -456,9 +452,13 @@ class Scanner:
                                 text, maxsplit=1, flags=re.I)[0].strip()
             return text
         target = normalize(name)
-        deadline = time.monotonic() + timeout
+        if timeout is None:
+            timeout = 30 if self.remote_deadline else 12
+        started = time.monotonic()
         if self.remote_deadline:
-            deadline = min(deadline, self.remote_deadline - 15)
+            # Keep time for subsequent navigation, availability reads and cleanup.
+            timeout = min(timeout, max(0, self.remote_deadline - started - 15))
+        deadline = started + timeout
         names, hits, seen_names = [], set(), set()
         button_hits = []
         scroll_started = False
@@ -474,9 +474,11 @@ class Scanner:
         while True:
             if not self.is_current():
                 raise ScanError('本轮查询已取消。')
+            read_started = time.monotonic()
             await self.wait_until_ready(page, timeout=5 if self.remote_deadline else 45)
             selector = LIST_SELECTOR if kind == 'activity' else 'a[href]'
             links = await page.locator(selector).evaluate_all(READ_TARGETS)
+            self.progress['page_read_seconds'] = round(time.monotonic() - read_started, 2)
             names, button_hits = [], []
             for item in links:
                 if not item['rendered']:
@@ -505,11 +507,13 @@ class Scanner:
                             seen_names.add(label)
             if time.monotonic() >= deadline:
                 break
+            scroll_call_started = time.monotonic()
             if not scroll_started:
                 await self.scroll_search(page, reset=True)
                 scroll_started = True
             state = await self.scroll_search(page)
             checked_at = time.monotonic()
+            self.progress['scroll_call_seconds'] = round(checked_at - scroll_call_started, 2)
             if state['at_bottom'] and not state['moved']:
                 if bottom_geometry != state['geometry']:
                     bottom_geometry, bottom_since, bottom_checks = state['geometry'], checked_at, 1

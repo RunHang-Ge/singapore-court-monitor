@@ -97,6 +97,10 @@ def format_failure(value, include_url=False):
         lines.append('该阶段已耗时：' + str(step.get('elapsed_seconds', '未知')) + ' 秒')
         if step.get('timeout_seconds') is not None:
             lines.append('此步骤等待上限：' + str(step['timeout_seconds']) + ' 秒')
+        if 'page_read_seconds' in step:
+            lines.append('最近一次页面读取耗时：' + str(step['page_read_seconds']) + ' 秒')
+        if 'scroll_call_seconds' in step:
+            lines.append('最近一次滚动操作耗时：' + str(step['scroll_call_seconds']) + ' 秒')
         if 'search_scroll_steps' in step:
             lines.append('滚动查找：' + str(step['search_scroll_steps']) + ' 次；累计 ' +
                          str(step.get('search_scroll_distance', 0)) + ' 像素')

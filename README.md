@@ -131,7 +131,7 @@ Browserless 免费方案的单次浏览器连接最长两分钟；入口不能�
 
 原有本机截图页面保留为调试备用：先暂停并等待查询结束，再刷新截图操作。它与 Telegram 的临时直播入口不是同一人工流程。若没有 Browserless，本机模式仍使用原有 45 秒自动等待和每轮关闭浏览器的策略，复杂页面加载峰值可能超过 512 MB。
 
-活动与场馆列表会先持续向下滚动，即使已在页面中找到目标链接，也会继续滚到底部。到达底部后，会等待列表高度稳定并重复确认无法继续向下滚动；若加载出新内容，则继续滚动。仍保留本轮查询与远程会话的超时限制，超时未到底时明确报告“尚未确认列表到底”，不采用部分结果。
+活动与场馆列表会先持续向下滚动，即使已在页面中找到目标链接，也会继续滚到底部。到达底部后，会等待列表高度稳定并重复确认无法继续向下滚动；若加载出新内容，则继续滚动。页面状态检查将标题、正文和安全标记合并为一次远程读取；本地列表查找默认最多 12 秒，远程模式默认最多 30 秒，并根据会话剩余时间缩短、至少预留 15 秒给后续操作。仍保留本轮查询与远程会话的超时限制，超时未到底时明确报告“尚未确认列表到底”，不采用部分结果。
 
 运动项目支持直接链接和需要先展开的分组按钮，并识别实际官网中的 Chakra 卡片展开行（div.chakra-stack + p + svg）。同一张卡片的 chakra-collapse 区域用于查找子选项，忽略折叠区域内尚未显示的链接。Tennis 分组展开后，会在该分组内精确选择同名 Tennis，不选择 Mini Tennis 或 Tennis Wall；若同名子选项缺失或不唯一，报告实际选项并停止本轮查询。
 
@@ -167,7 +167,7 @@ cd F:\Github\singapore-court-monitor
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
-.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser test_query_feedback test_slot_reader test_navigation test_scrolling test_activity_controls test_chakra_activities
+.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser test_query_feedback test_slot_reader test_navigation test_scrolling test_activity_controls test_chakra_activities test_remote_latency
 .\.venv\Scripts\python.exe browser_diagnostic.py --check
 ```
 
@@ -191,6 +191,7 @@ py -3.13 -m venv .venv
 - `scanner.py`：官网活动与场馆可见按钮点击、页面切换核验与分步骤诊断、日期按钮切换、活动与场馆卡片滚动查找与加载等待、场馆名称与预览状态分离、名称唯一核验、日期核验、时段分组加载等待、时段读取、人工接管和浏览器操作。
 - `remote_browser.py`：Browserless 档案创建与复用、临时入口校验和关闭。
 - `activity_controls.py`：活动链接与展开按钮识别、可见名称精确匹配、按钮定位。
+- `page_snapshot.py`：一次读取页面标题、正文和安全标记，减少远程往返并保持证据来自同一文档。
 - `page_scrolling.py`：活动与场馆列表的分页滚动查找、内部滚动容器处理、目标按钮位置确认。
 - `slot_reader.py`：按分组文字和实际包含关系区分即时预约与抽签，支持普通文字标题、兄弟标题和 aria-labelledby；不把全页所有控件当成即时预约。
 - `models.py`：参数解析、新加坡时间、一小时筛选、通知格式。
