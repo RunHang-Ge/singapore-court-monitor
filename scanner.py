@@ -17,7 +17,7 @@ from memory_usage import log_memory
 from models import now_sg, slot_from_control, SG
 from slot_reader import READ_SLOTS
 from page_scrolling import SCROLL_LIST, TARGET_POSITION
-from activity_controls import ActivityButton, LIST_SELECTOR, READ_TARGETS, matches
+from activity_controls import ActivityButton, LIST_SELECTOR, READ_TARGETS, TARGET_EVIDENCE, matches
 
 BASE = 'https://activesg.gov.sg'
 ACTIVITIES = BASE + '/facility-bookings/activities'
@@ -551,6 +551,12 @@ class Scanner:
             diagnostic = {'category': 'unavailable', 'label': '未取得页面证据', 'evidence': []}
         diagnostic['lookup'] = {'kind': kind, 'requested': name[:200], 'candidate_names': names,
                                 'exact_destinations': len(hits), 'exact_buttons': len(button_hits)}
+        if diagnostic.get('category') == 'page_loaded':
+            try:
+                diagnostic['lookup']['target_elements'] = await asyncio.wait_for(page.evaluate(
+                    TARGET_EVIDENCE, {'name': name, 'selector': LIST_SELECTOR if kind == 'activity' else 'a[href]'}), timeout=2)
+            except Exception:
+                pass
         failure = ScanError(text)
         failure.diagnostic = diagnostic
         raise failure
@@ -615,6 +621,12 @@ class Scanner:
         self.progress['clicked'] = True
 
     async def activity_panel(self, page, button, target):
+        if button.chakra_card:
+            # The real card has a disclosure row and a sibling collapse panel.
+            # Keep child selection within this card, regardless of other groups.
+            panel = target.locator('..').locator(':scope > .chakra-collapse:visible')
+            shown = await panel.evaluate_all("nodes => nodes.length === 1 && Number(getComputedStyle(nodes[0]).opacity) > 0")
+            return panel if shown else None
         # Clicking can already have replaced the document. Read a snapshot
         # without auto-waiting for an old button to reappear on the new page.
         control = await target.evaluate_all("nodes => nodes.length === 1 ? {controls:nodes[0].getAttribute('aria-controls')} : null")
@@ -661,8 +673,11 @@ class Scanner:
             raise ScanError('运动项目按钮已变化或不唯一，本轮未采用。')
         before = urlparse(page.url)
         self.progress.update(activity_group=button.name, activity_group_expanded=False)
-        expanded = await target.evaluate('''n => n.tagName === 'SUMMARY'
-            ? n.parentElement.open : n.getAttribute('aria-expanded') === 'true' ''')
+        if button.chakra_card:
+            expanded = await self.activity_panel(page, button, target) is not None
+        else:
+            expanded = await target.evaluate('''n => n.tagName === 'SUMMARY'
+                ? n.parentElement.open : n.getAttribute('aria-expanded') === 'true' ''')
         if not expanded:
             await self.click_target(page, target, button.name, max(0.05, deadline - time.monotonic()))
         self.mark_operation('等待' + button.name[:100] + '展开或进入场馆列表', timeout=timeout)
@@ -706,7 +721,7 @@ class Scanner:
                 remaining = max(0.05, deadline - time.monotonic())
                 if len(links) == 1:
                     self.progress['activity_selected'] = button.name
-                    return await self.click_link(page, links.pop(), timeout=remaining)
+                    return await self.click_link(page, links.pop(), timeout=remaining, scope=panel)
                 if len(buttons) == 1:
                     self.progress['activity_selected'] = button.name
                     return await self.click_activity_button(page, buttons[0], timeout=remaining, depth=depth + 1, scope=panel)
@@ -722,21 +737,22 @@ class Scanner:
         raise failure
 
 
-    async def click_link(self, page, destination, timeout=15):
+    async def click_link(self, page, destination, timeout=15, scope=None):
         # Click the actual visible card; responsive pages may contain hidden
         # copies with the same href before the visible one.
         if isinstance(destination, ActivityButton):
-            return await self.click_activity_button(page, destination, timeout=timeout)
+            return await self.click_activity_button(page, destination, timeout=timeout, scope=scope)
         destination = official_url(destination)
-        links = await page.locator('a[href]').evaluate_all("""nodes => nodes.map(n => ({
-            href: n.href, raw: n.getAttribute('href'),
-            rendered: !!([n, ...n.children].some(c => {
-                const box = c.getBoundingClientRect(); return box.width > 0 && box.height > 0;
-            }) && getComputedStyle(n).visibility !== 'hidden' && !n.closest('[hidden],[aria-hidden="true"]'))
-        }))""")
+        root = scope if scope is not None else page
+        links = await root.locator('a[href]').evaluate_all(READ_TARGETS)
+        occurrences = {}
         for link in links:
+            index = occurrences.get(link['raw'], 0)
+            occurrences[link['raw']] = index + 1
             if link['href'] == destination and link['rendered']:
-                target = page.locator('a[href=' + json.dumps(link['raw']) + ']:visible').first
+                # Retain the node identified above. A clipped duplicate with
+                # the same href can still match Playwright's :visible selector.
+                target = root.locator('a[href=' + json.dumps(link['raw']) + ']').nth(index)
                 name = self.progress.get('target') or '页面按钮'
                 await self.click_target(page, target, name, timeout)
                 self.mark_operation('等待点击后的页面切换', timeout=timeout, clicked=True)

@@ -133,6 +133,14 @@ def format_failure(value, include_url=False):
         lines.append('目标名称：' + str(lookup.get('requested', ''))[:200])
         candidates = lookup.get('candidate_names', [])
         lines.append('页面读取到的名称：' + ('、'.join(str(n)[:100] for n in candidates[:8]) if candidates else '没有读取到活动或场馆链接，可能仍未加载或官网结构改变'))
+        for chain in lookup.get('target_elements', [])[:2]:
+            nodes = []
+            for node in chain[:4]:
+                label = node.get('tag', '?') + ''.join('.' + name for name in node.get('classes', [])[:2])
+                if node.get('selected'):
+                    label += '（符合入口选择器）'
+                nodes.append(label)
+            lines.append('目标文字所在元素：' + ' → '.join(nodes))
     slots = value.get('slots')
     if isinstance(slots, dict):
         lines.append('读取阶段：时段分组；日期：' + str(slots.get('date', '未知日期'))[:20])

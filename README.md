@@ -133,11 +133,11 @@ Browserless 免费方案的单次浏览器连接最长两分钟；入口不能�
 
 活动与场馆列表会先持续向下滚动，即使已在页面中找到目标链接，也会继续滚到底部。到达底部后，会等待列表高度稳定并重复确认无法继续向下滚动；若加载出新内容，则继续滚动。仍保留本轮查询与远程会话的超时限制，超时未到底时明确报告“尚未确认列表到底”，不采用部分结果。
 
-运动项目支持直接链接和需要先展开的分组按钮。Tennis 分组展开后，会在该分组内精确选择同名 Tennis，不选择 Mini Tennis 或 Tennis Wall；若同名子选项缺失或不唯一，报告实际选项并停止本轮查询。
+运动项目支持直接链接和需要先展开的分组按钮，并识别实际官网中的 Chakra 卡片展开行（div.chakra-stack + p + svg）。同一张卡片的 chakra-collapse 区域用于查找子选项，忽略折叠区域内尚未显示的链接。Tennis 分组展开后，会在该分组内精确选择同名 Tennis，不选择 Mini Tennis 或 Tennis Wall；若同名子选项缺失或不唯一，报告实际选项并停止本轮查询。
 
 ## 确认安全检查的来源
 
-发送 /diagnose 获取最近一次失败时保存的证据。活动或场馆匹配失败时，还会显示查找阶段、目标名称与页面读取到的候选名称；操作失败时会显示实际阶段、等待步骤、耗时、滚动查找次数、目标按钮是否进入画面和点击状态；时段分组读取失败时，也会显示查询日期、分组文字、页面标题文字和控件数量；仅记录官网 facility-bookings 页面中的这些有限信息，不保存完整正文、登录字段或带参数的地址。服务首页「上次查询失败时的证据」可显示页面标题、来源网址（已去除查询参数）、主页面 HTTP 状态、Cloudflare 标记和失败截图；读取证据不会启动浏览器。查询失败后才会保存，因此上线这个版本后需要再查询一次。
+发送 /diagnose 获取最近一次失败时保存的证据。活动或场馆匹配失败时，还会显示查找阶段、目标名称与页面读取到的候选名称，以及目标文字实际所在的有限元素层级；操作失败时会显示实际阶段、等待步骤、耗时、滚动查找次数、目标按钮是否进入画面和点击状态；时段分组读取失败时，也会显示查询日期、分组文字、页面标题文字和控件数量；仅记录官网 facility-bookings 页面中的这些有限信息，不保存完整正文、登录字段或带参数的地址。服务首页「上次查询失败时的证据」可显示页面标题、来源网址（已去除查询参数）、主页面 HTTP 状态、Cloudflare 标记和失败截图；读取证据不会启动浏览器。查询失败后才会保存，因此上线这个版本后需要再查询一次。
 
 - cf-mitigated: challenge 明确证明收到 Cloudflare 整页检查；检查页中的 _cf_chl_opt 也是其明确标记。
 - CF-Ray 或 Server: cloudflare 单独出现只能说明经过 Cloudflare，不能证明拦截。Cloudflare 脚本或品牌文字与检查文字同时出现时仍标为「疑似」。
@@ -167,7 +167,7 @@ cd F:\Github\singapore-court-monitor
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
-.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser test_query_feedback test_slot_reader test_navigation test_scrolling test_activity_controls
+.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser test_query_feedback test_slot_reader test_navigation test_scrolling test_activity_controls test_chakra_activities
 .\.venv\Scripts\python.exe browser_diagnostic.py --check
 ```
 
