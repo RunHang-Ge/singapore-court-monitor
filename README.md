@@ -17,6 +17,17 @@ Python 3 / FastAPI 的 ActiveSG 空场监控，连接现有 Telegram 机器人 `
 - 日期到期后停止查询并通知。
 - 私聊账号绑定，其他账号、群聊、转发和编辑消息不能修改条件。
 
+## The Kallang：先验证登录与预约页面
+
+此阶段只接入一次性登录检查，尚未为 PerfectGym 新站启用日期规则或定时查询。
+Render 环境变量新增 `KALLANG_LOGIN_USERNAME`（邮箱账号）、`KALLANG_LOGIN_PASSWORD`；账号密码不发送到聊天、GitHub 或日志。继续使用已有的 `BROWSERLESS_TOKEN`。
+
+推送新版本并等待 Render Live 后，在已绑定的 Telegram 私聊发送 `/kallang`，或在受管理员密码保护的首页点击“登录并查看场地日期”。程序会等当前浏览器操作完成，使用新站独立档案登录，只点击实际可见的场地预约导航，不提交预约或付款。若有验证或页面仍需操作，会发送短期远程浏览器入口；在同一页面完成登录、打开场地与日期，点击 Done 后仍需以实际界面确认，不能仅凭 Done 宣称成功。
+
+检查结果只报告有限的预约标题、场地名称、可见日期和筛选项。`/kallang_status` 或管理首页可查看本次结果。必须实际读到具体场地和日期才能标记已确认；仅完成登录时会说明未读取完整。收到实际页面信息后，再确认监控日期规则。
+
+新站档案位于 `/var/data/kallang`，与 ActiveSG 分开；两站浏览器操作排队以避免远程并发和内存增长。登录页不截图、不保存完整 HTML、账号密码或输入值。免费 Browserless 单次连接时限仍适用；入口到期后需重新发送 `/kallang`。部署只新增检查能力，不会自动登录或开启第二项监控。ActiveSG 的条件和十分钟监控保持原有行为。
+
 ## 现有 Render Web Service 配置
 
 本项目使用 Render 的原生 **Python 3** 运行环境，不需要将语言改为 Docker。
@@ -168,7 +179,7 @@ cd F:\Github\singapore-court-monitor
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
-.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser test_query_feedback test_slot_reader test_navigation test_scrolling test_activity_controls test_chakra_activities test_remote_latency test_date_time_flow
+.\.venv\Scripts\python.exe -m unittest -v test_monitor test_remote_browser test_query_feedback test_slot_reader test_navigation test_scrolling test_activity_controls test_chakra_activities test_remote_latency test_date_time_flow test_kallang_portal test_kallang_engine
 .\.venv\Scripts\python.exe browser_diagnostic.py --check
 ```
 

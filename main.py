@@ -71,7 +71,7 @@ def admin(request: Request, credentials: HTTPBasicCredentials | None = Depends(s
 async def health(request: Request):
     engine = request.app.state.engine
     return {'status': 'ok', 'telegram_connected': engine.ready, 'monitor_configured': engine.config() is not None,
-            'revision': os.getenv('RENDER_GIT_COMMIT'), 'features': ['telegram_human_browser']}
+            'revision': os.getenv('RENDER_GIT_COMMIT'), 'features': ['telegram_human_browser', 'kallang_login_inspection']}
 
 
 @app.post('/telegram/webhook')
@@ -117,11 +117,24 @@ async def status(request: Request):
             'browser_busy': engine.scanner.busy,
             'browser_active': engine.scanner.browser_active, 'human_waiting': bool(engine.scanner.handoff), 'memory': snapshot(),
             'binding_command': '/start ' + engine.binding_code if not engine.store.get('owner') else None,
-            'persistent_disk_configured': os.getenv('DATA_DIR', '').startswith('/var/data')}
+            'persistent_disk_configured': os.getenv('DATA_DIR', '').startswith('/var/data'),
+            'kallang_text': engine.kallang_status(), 'kallang_busy': engine.kallang_pending or engine.kallang.busy}
+
+
+@app.post('/kallang/inspect', dependencies=[Depends(admin)])
+async def kallang_inspect(request: Request):
+    if not hmac.compare_digest(request.headers.get('x-monitor-csrf', ''), request.app.state.csrf):
+        raise HTTPException(403, '请刷新管理页面后重试。')
+    try:
+        return {'ok': True, 'text': request.app.state.engine.request_kallang()}
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from None
 
 
 @app.get('/browser/screenshot', dependencies=[Depends(admin)])
 async def screenshot(request: Request):
+    if request.app.state.engine.kallang.busy:
+        raise HTTPException(409, '正在检查 The Kallang 登录，请等待完成后再操作 ActiveSG 浏览器。')
     try:
         image = await request.app.state.engine.scanner.screenshot()
         return Response(image, media_type='image/jpeg', headers={'Cache-Control': 'no-store'})
@@ -135,6 +148,8 @@ async def screenshot(request: Request):
 async def browser_action(request: Request):
     if not hmac.compare_digest(request.headers.get('x-monitor-csrf', ''), request.app.state.csrf):
         raise HTTPException(403, '请刷新管理页面后重试。')
+    if request.app.state.engine.kallang.busy:
+        raise HTTPException(409, '正在检查 The Kallang 登录，请等待完成后再操作 ActiveSG 浏览器。')
     if len(await request.body()) > 4096:
         raise HTTPException(413, '输入过长。')
     try:

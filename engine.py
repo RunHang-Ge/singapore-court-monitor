@@ -11,6 +11,7 @@ from remote_browser import RemoteBrowserError
 from query_diagnostics import format_failure
 from models import Config, now_sg, parse_dates, parse_set, parse_window, summaries, query_summaries, unavailable_dates
 from telegram_api import TelegramError
+from kallang_portal import KallangPortal
 
 HELP = '''可用指令：
 /set Tennis / Kallang Tennis Centre / 2026-10-12~2026-10-18 / 19:00-22:00
@@ -23,6 +24,8 @@ HELP = '''可用指令：
 /diagnose 查看失败时保存的页面证据
 /browser 获取人工验证入口（通过 Telegram 发送）
 /check 立即查询一次
+/kallang 登录 The Kallang 并查看场地日期（一次性）
+/kallang_status 查看新站登录检查结果
 /pause 暂停；/resume 恢复
 
 时间点为一小时场次的开始时间，例如 19:00-21:00 匹配 19:00、20:00。每轮完成后每天一行，不附链接；页面未提供的日期会注明不可查询。/check 返回本轮完整结果；自动提醒只包含新增或重新出现的时间点，及变化的不可查询日期。'''
@@ -38,13 +41,17 @@ class Engine:
             store.put('binding_code', self.binding_code)
         self.ready, self.connection_error, self.delivery_error = False, None, None
         self.trigger = asyncio.Event()
+        self.browser_gate = asyncio.Lock()
+        self.kallang = KallangPortal(store.directory)
+        self.kallang_trigger = asyncio.Event()
+        self.kallang_pending = False
         self.tasks = []
         self.busy, self.next_check = False, None
         self.scan_revision = None
         self.stopping = False
         # A process restart cannot restore the live page or its temporary access.
         with store.transaction():
-            store.db.execute("DELETE FROM outbox WHERE kind LIKE 'human:%'")
+            store.db.execute("DELETE FROM outbox WHERE kind LIKE 'human:%' OR kind LIKE 'kallang:human:%'")
         owner = os.getenv('TELEGRAM_USER_ID', '').strip()
         chat = os.getenv('TELEGRAM_CHAT_ID', '').strip() or owner
         if owner:
@@ -66,7 +73,8 @@ class Engine:
 
     def start(self):
         self.tasks = [asyncio.create_task(self.connect_loop()), asyncio.create_task(self.update_loop()),
-                      asyncio.create_task(self.notice_loop()), asyncio.create_task(self.monitor_loop())]
+                      asyncio.create_task(self.notice_loop()), asyncio.create_task(self.monitor_loop()),
+                      asyncio.create_task(self.kallang_loop())]
 
     async def close(self):
         self.stopping = True
@@ -74,6 +82,7 @@ class Engine:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.scanner.close()
+        await self.kallang.close()
         await self.telegram.close()
         self.store.close()
 
@@ -219,6 +228,10 @@ class Engine:
         try:
             if command in ('/start', '/help') or command == '/set' and not argument:
                 reply = HELP
+            elif command == '/kallang':
+                reply = self.request_kallang()
+            elif command == '/kallang_status':
+                reply = self.kallang_status()
             elif command == '/status':
                 reply = self.status()
             elif command == '/diagnose':
@@ -331,6 +344,10 @@ class Engine:
                     with self.store.transaction():
                         self.store.sent_notice(notice['id'])
                     continue
+                if notice['kind'].startswith('kallang:human:') and not self.kallang.valid_handoff(notice['kind'][14:]):
+                    with self.store.transaction():
+                        self.store.sent_notice(notice['id'])
+                    continue
                 receipt = await self.telegram.send(owner['chat_id'], notice['text'])
                 with self.store.transaction():
                     self.store.sent_notice(notice['id'])
@@ -355,6 +372,12 @@ class Engine:
         return request if request and request.get('revision') == revision else None
 
     async def run_scan(self):
+        # A one-off Kallang inspection and the existing monitor share one
+        # browser slot. Waiting here avoids a false ActiveSG failure/extra Chrome.
+        async with self.browser_gate:
+            return await self._run_scan()
+
+    async def _run_scan(self):
         config, rt = self.config(), self.runtime()
         if not config or not rt['enabled'] or not self.store.get('owner') or not self.ready:
             return
@@ -429,6 +452,76 @@ class Engine:
             self.scanner.is_current = lambda: True
             self.busy = False
             self.scan_revision = None
+
+    def request_kallang(self):
+        if not self.store.get('owner'):
+            raise ValueError('请先绑定 Telegram 私聊，再开始 The Kallang 登录检查。')
+        if not self.ready:
+            raise ValueError('请等待 Telegram 连接成功后再开始新站登录检查，以便接收需要人工操作时的入口。')
+        if self.kallang_pending or self.kallang.busy:
+            return 'The Kallang 登录检查已安排或正在进行，请等待本轮结果；/kallang_status 查看状态。'
+        if not os.getenv('KALLANG_LOGIN_USERNAME', '').strip() or not os.getenv('KALLANG_LOGIN_PASSWORD', ''):
+            raise ValueError('请在 Render 设置 KALLANG_LOGIN_USERNAME 和 KALLANG_LOGIN_PASSWORD；账号密码不要发送到聊天。')
+        if not os.getenv('BROWSERLESS_TOKEN', '').strip():
+            raise ValueError('请先在 Render 设置 BROWSERLESS_TOKEN，再开始新站登录检查。')
+        self.kallang_pending = True
+        self.kallang_trigger.set()
+        return '已安排 The Kallang 一次性登录检查；当前浏览器操作结束后开始，场地和日期结果会统一发给你。需要人工操作时会发送临时入口。'
+
+    @staticmethod
+    def format_kallang(result):
+        lines = ['The Kallang 登录检查', result['message']]
+        for key, label in (('headings', '预约页面'), ('venues', '页面场地'), ('dates', '可见日期'), ('filters', '可见筛选项')):
+            if result.get(key):
+                lines.append(label + '：' + '、'.join(result[key][:20]))
+        lines.append('目前仅检查登录和页面，尚未启用新站监控。')
+        # Each field is bounded by the portal reader; keep the whole Telegram
+        # report in one message even if the site exposes many public labels.
+        return '\n'.join(lines)[:3800]
+
+    def kallang_status(self):
+        if self.kallang_pending:
+            return 'The Kallang 登录检查已排队，等待当前浏览器操作完成。'
+        if self.kallang.busy:
+            return 'The Kallang 登录检查正在进行；需要人工操作时会通过 Telegram 发送入口。'
+        result = self.store.get('kallang_result')
+        return self.format_kallang(result) if result else '尚未进行 The Kallang 登录检查；发送 /kallang 开始。'
+
+    async def run_kallang(self):
+        async def notify_human(handoff):
+            if self.kallang.valid_handoff(handoff['id']) and not self.stopping:
+                with self.store.transaction():
+                    self.store.queue(['The Kallang 临时浏览器入口（新加坡时间 ' + handoff['expires_at'] + ' 到期）：\n' +
+                                      handoff['url'] + '\n请在同一页面完成登录并进入场地日期页面，完成后点 Done。'],
+                                     self.runtime()['revision'], 'kallang:human:' + handoff['id'])
+        async with self.browser_gate:
+            async with self.scanner.lock:
+                # Release the prior site's idle remote connection before using
+                # another profile; the ActiveSG cookie/profile stays intact.
+                await self.scanner.release_browser()
+                self.kallang_pending = False
+                result = await self.kallang.inspect(on_human=notify_human)
+        result['checked_at'] = now_sg().isoformat()
+        with self.store.transaction():
+            self.store.set('kallang_result', result)
+            self.store.queue([self.format_kallang(result)], self.runtime()['revision'], 'kallang:result')
+
+    async def kallang_loop(self):
+        while not self.stopping:
+            await self.kallang_trigger.wait()
+            self.kallang_trigger.clear()
+            try:
+                await self.run_kallang()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Never forward browser exceptions or environment values.
+                result = {'status': 'error', 'message': 'The Kallang 登录检查未完成，请稍后发送 /kallang 重试。'}
+                with self.store.transaction():
+                    self.store.set('kallang_result', result)
+                    self.store.queue([self.format_kallang(result)], self.runtime()['revision'], 'kallang:result')
+            finally:
+                self.kallang_pending = False
 
     async def monitor_loop(self):
         self.trigger.set()

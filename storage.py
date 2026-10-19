@@ -74,7 +74,7 @@ class Store:
 
     def next_notice(self, revision):
         with self.transaction():
-            self.db.execute('DELETE FROM outbox WHERE revision != ?', (revision,))
+            self.db.execute("DELETE FROM outbox WHERE revision != ? AND kind NOT LIKE 'kallang:%'", (revision,))
         return self.db.execute('SELECT * FROM outbox WHERE sent=0 ORDER BY id LIMIT 1').fetchone()
 
     def sent_notice(self, notice_id):
